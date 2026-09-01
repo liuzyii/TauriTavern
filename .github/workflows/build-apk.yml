@@ -80,6 +80,25 @@ jobs:
       - name: Enable HTTP access for mobile
         run: ./scripts/ci/configure-mobile-http.sh enable android
 
+      - name: Setup Android signing (CI throwaway keystore)
+        shell: bash
+        run: |
+          # gen/android/app/build.gradle.kts reads keystore.properties unconditionally
+          # (keyAlias = keystoreProperties["keyAlias"] as String), so a missing file
+          # fails ANY build ("null cannot be cast to non-null type kotlin.String").
+          # Generate a throwaway keystore; replace with real ANDROID_KEY_* secrets
+          # for a production-signed release APK.
+          cd src-tauri/crates/tauritavern/gen/android
+          keytool -genkeypair -v -keystore "$RUNNER_TEMP/keystore.jks" \
+            -alias tauri -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass tauritavern -keypass tauritavern \
+            -dname "CN=CI, OU=CI, O=CI, L=CI, ST=CI, C=CN" 2>/dev/null
+          {
+            echo "keyAlias=tauri"
+            echo "password=tauritavern"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks"
+          } > keystore.properties
+
       - name: Build debug APK
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
