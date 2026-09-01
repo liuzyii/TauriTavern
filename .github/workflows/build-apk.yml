@@ -10,6 +10,8 @@
 #      so the workflow runs with zero secrets. (build.gradle.kts reads
 #      keystore.properties unconditionally; without it ANY build fails with
 #      "null cannot be cast to non-null type kotlin.String".)
+#   3. arm64-only: builds aarch64 (arm64-v8a) only, no 32-bit device support
+#      (--target aarch64), which halves Rust cross-compile time.
 #
 # Triggers: push to main, or manual via Actions -> "Build Android APK".
 
@@ -40,7 +42,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi
+          targets: aarch64-linux-android
 
       - name: Setup JDK
         uses: actions/setup-java@v5
@@ -104,7 +106,7 @@ jobs:
           projectPath: src-tauri/crates/tauritavern
           tauriScript: node ../../../scripts/tauri-app.mjs
           mobile: android
-          args: --verbose --apk --split-per-abi --target aarch64 armv7
+          args: --verbose --apk --split-per-abi --target aarch64
           uploadWorkflowArtifacts: true
           uploadPlainBinary: true
           uploadUpdaterJson: false
