@@ -1,0 +1,95 @@
+# Build Android APK for TauriTavern fork
+#
+# Zero-secrets workflow: produces a DEBUG-signed APK that installs on any
+# phone. Runs automatically on every push to `main` and can also be started
+# manually (Actions tab -> "Build Android APK" -> Run workflow).
+#
+# Why debug and not release: the release build type in
+# src-tauri/crates/tauritavern/gen/android/app/build.gradle.kts requires
+# keystore.properties (ANDROID_KEY_* secrets). Debug builds are signed with
+# the auto-generated debug keystore, so no secrets are needed. If you want a
+# release-signed APK later, add the ANDROID_KEY_* secrets and switch
+# `--debug` to `--release` (see canary-release.yml for the exact pattern).
+
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: apk-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Setup JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+          cache-dependency-path: |
+            src-tauri/crates/tauritavern/gen/android/**/*.gradle*
+            src-tauri/crates/tauritavern/gen/android/**/gradle-wrapper.properties
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r29
+          link-to-sdk: true
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          run_install: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Enable HTTP access for mobile
+        run: ./scripts/ci/configure-mobile-http.sh enable android
+
+      - name: Build debug APK
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        # pnpm android:build = node scripts/tauri-app.mjs --prepare-frontend android build
+        # (prepares the web frontend, then runs the pinned local Tauri CLI)
+        run: pnpm android:build -- --apk --debug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TauriTavern-debug-apk
+          path: src-tauri/crates/tauritavern/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
