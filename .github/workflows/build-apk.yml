@@ -1,15 +1,17 @@
-# Build Android APK for TauriTavern fork
+# Build Android APK for the TauriTavern fork
 #
-# Zero-secrets workflow: produces a DEBUG-signed APK that installs on any
-# phone. Runs automatically on every push to `main` and can also be started
-# manually (Actions tab -> "Build Android APK" -> Run workflow).
+# This workflow mirrors the upstream Android build chain from
+# canary-release.yml (tauri-apps/tauri-action@v1 + the repo's own
+# scripts/tauri-app.mjs wrapper + the same --apk --split-per-abi --target
+# args), with only two fork-specific adjustments:
+#   1. No `prepare` job (upstream needs a Canary tag + an existing latest
+#      release, which a fresh fork does not have).
+#   2. Signing uses a throwaway CI keystore instead of ANDROID_KEY_* secrets,
+#      so the workflow runs with zero secrets. (build.gradle.kts reads
+#      keystore.properties unconditionally; without it ANY build fails with
+#      "null cannot be cast to non-null type kotlin.String".)
 #
-# Why debug and not release: the release build type in
-# src-tauri/crates/tauritavern/gen/android/app/build.gradle.kts requires
-# keystore.properties (ANDROID_KEY_* secrets). Debug builds are signed with
-# the auto-generated debug keystore, so no secrets are needed. If you want a
-# release-signed APK later, add the ANDROID_KEY_* secrets and switch
-# `--debug` to `--release` (see canary-release.yml for the exact pattern).
+# Triggers: push to main, or manual via Actions -> "Build Android APK".
 
 name: Build Android APK
 
@@ -31,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux host dependencies
+      - name: Install Android host dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev
@@ -40,7 +42,7 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi
 
-      - name: Setup JDK 21
+      - name: Setup JDK
         uses: actions/setup-java@v5
         with:
           java-version: "21"
@@ -74,20 +76,11 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
-
-      - name: Enable HTTP access for mobile
-        run: ./scripts/ci/configure-mobile-http.sh enable android
+      - run: pnpm install --frozen-lockfile
 
       - name: Setup Android signing (CI throwaway keystore)
         shell: bash
         run: |
-          # gen/android/app/build.gradle.kts reads keystore.properties unconditionally
-          # (keyAlias = keystoreProperties["keyAlias"] as String), so a missing file
-          # fails ANY build ("null cannot be cast to non-null type kotlin.String").
-          # Generate a throwaway keystore; replace with real ANDROID_KEY_* secrets
-          # for a production-signed release APK.
           cd src-tauri/crates/tauritavern/gen/android
           keytool -genkeypair -v -keystore "$RUNNER_TEMP/keystore.jks" \
             -alias tauri -keyalg RSA -keysize 2048 -validity 10000 \
@@ -99,16 +92,21 @@ jobs:
             echo "storeFile=$RUNNER_TEMP/keystore.jks"
           } > keystore.properties
 
-      - name: Build debug APK
-        env:
-          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        # pnpm android:build = node scripts/tauri-app.mjs --prepare-frontend android build
-        # (prepares the web frontend, then runs the pinned local Tauri CLI)
-        run: pnpm android:build -- --apk --debug
+      - name: Enable HTTP access for mobile
+        run: ./scripts/ci/configure-mobile-http.sh enable android
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - name: Build APK
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         with:
-          name: TauriTavern-debug-apk
-          path: src-tauri/crates/tauritavern/gen/android/app/build/outputs/apk/**/*.apk
-          if-no-files-found: error
+          projectPath: src-tauri/crates/tauritavern
+          tauriScript: node ../../../scripts/tauri-app.mjs
+          mobile: android
+          args: --verbose --apk --split-per-abi --target aarch64 armv7
+          uploadWorkflowArtifacts: true
+          uploadPlainBinary: true
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: false
+          workflowArtifactNamePattern: 'TauriTavern-${{ github.run_number }}-apk-[arch]-[bundle]'
