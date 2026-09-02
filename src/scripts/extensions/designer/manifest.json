@@ -3,8 +3,11 @@
     "loading_order": 55,
     "requires": [],
     "optional": [],
-    "js": "dist/index.bundle.js",
+    "js": "src/index.js",
     "author": "TauriTavern",
     "version": "0.1.0",
-    "description": "CRUD function tools for character cards, world info, and system prompts via SillyTavern native function calling."
+    "description": "CRUD function tools for character cards, world info, and system prompts via SillyTavern native function calling.",
+    "hooks": {
+        "activate": "init"
+    }
 }

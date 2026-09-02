@@ -653,7 +653,10 @@ const default_settings = {
     inline_image_quality: 'auto',
     bypass_status_check: false,
     continue_prefill: false,
-    function_calling: false,
+    // TauriTavern: function calling defaults ON so bundled tool extensions
+    // (e.g. Designer) are exposed to the LLM out of the box. A persisted
+    // user setting still wins over this default.
+    function_calling: true,
     tool_call_recurse_limit: 5,
     names_behavior: character_names_behavior.DEFAULT,
     continue_postfix: continue_postfix_types.SPACE,

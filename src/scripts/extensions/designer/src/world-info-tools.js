@@ -8,9 +8,11 @@ import {
     normalizeWorldEntryUpdates,
     ok,
     optionalString,
+    pickFields,
     requireCompleteFields,
     requireString,
     verifyRevOrThrow,
+    verifyUpdateOrThrow,
 } from './common.js';
 
 const MAX_ENTRY_LIST = 500;
@@ -39,25 +41,25 @@ const WORLD_ENTRY_SCHEMA = {
  * primary surface; book-level create/delete are supported with an explicit rev.
  * @param {{st: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>}} deps
  */
-export function createWorldInfoResource({ st, revLock }) {
+export function createWorldInfoResource({ worldInfo, revLock }) {
     const bookKey = (book) => `world:${book}`;
     const entryKey = (book, uid) => `world-entry:${book}:${uid}`;
 
-    function getBook(mod, book) {
-        const data = mod.worldInfoCache.get(book);
+    function getBook(book) {
+        const data = worldInfo.worldInfoCache.get(book);
         if (data && typeof data === 'object' && data.entries) {
             return data;
         }
         // Case-insensitive fallback: models frequently mis-case book names.
         const expected = String(book).trim().toLowerCase();
-        const matched = [...mod.worldInfoCache.keys()].find((name) => String(name).toLowerCase() === expected);
+        const matched = [...worldInfo.worldInfoCache.keys()].find((name) => String(name).toLowerCase() === expected);
         if (matched) {
-            const matchedData = mod.worldInfoCache.get(matched);
+            const matchedData = worldInfo.worldInfoCache.get(matched);
             if (matchedData && typeof matchedData === 'object' && matchedData.entries) {
                 return matchedData;
             }
         }
-        const available = [...mod.worldInfoCache.keys()].join(', ');
+        const available = [...worldInfo.worldInfoCache.keys()].join(', ');
         throw designerError('designer.book_not_found', `World info "${book}" was not found. Available books: ${available || 'none'}.`);
     }
 
@@ -81,14 +83,13 @@ export function createWorldInfoResource({ st, revLock }) {
     }
 
     async function read(params = {}) {
-        const mod = await st.loadWorldInfo();
-        const book = optionalString(params.book);
+                const book = optionalString(params.book);
 
         if (!book) {
-            const books = [...mod.worldInfoCache.keys()]
+            const books = [...worldInfo.worldInfoCache.keys()]
                 .sort()
                 .map((name) => {
-                    const data = mod.worldInfoCache.get(name);
+                    const data = worldInfo.worldInfoCache.get(name);
                     return {
                         name,
                         entries: data && data.entries ? Object.keys(data.entries).length : 0,
@@ -97,7 +98,7 @@ export function createWorldInfoResource({ st, revLock }) {
             return ok({ books, count: books.length });
         }
 
-        const data = getBook(mod, book);
+        const data = getBook(book);
 
         if (params.uid === undefined || params.uid === null) {
             const entries = Object.entries(data.entries)
@@ -111,53 +112,57 @@ export function createWorldInfoResource({ st, revLock }) {
         const entry = getEntry(data, book, uid);
         const maxChars = normalizeMaxChars(params.maxChars, DEFAULT_READ_MAX_CHARS);
         const content = truncateEntryContent(entry.content, maxChars);
-        const rev = await revLock.issue(entryKey(book, uid), entry);
+        const truncated = String(entry.content ?? '').length !== content.length;
+        const rev = await revLock.issue(entryKey(book, uid), entry, { truncated });
+        // The read surface must equal the update surface: only the editable
+        // fields are returned, so "copy every field from the read result"
+        // (complete-object contract) is exactly satisfiable.
+        const entryView = pickFields(entry, WORLD_ENTRY_FIELD_LIST);
+        entryView.content = content;
 
         return ok({
             book,
             uid,
-            entry: { ...entry, content },
+            entry: entryView,
             rev,
-            truncated: String(entry.content ?? '').length !== content.length,
+            truncated,
         });
     }
 
     async function create(params = {}) {
-        const mod = await st.loadWorldInfo();
-        const book = requireString(params.book, 'book');
-        const existing = mod.worldInfoCache.get(book);
+                const book = requireString(params.book, 'book');
+        const existing = worldInfo.worldInfoCache.get(book);
 
         if (params.entry === undefined || params.entry === null) {
             if (existing) {
                 throw designerError('designer.book_exists', `World info "${book}" already exists.`);
             }
             const data = { entries: {} };
-            await mod.saveWorldInfo(book, data, true);
+            await worldInfo.saveWorldInfo(book, data, true);
             const rev = await revLock.commit(bookKey(book), { book, data });
             return ok({ book, created: 'book', rev });
         }
 
         const normalized = normalizeWorldEntryForCreate(params.entry);
         const data = existing && existing.entries ? existing : { entries: {} };
-        const uid = mod.getFreeWorldEntryUid(data);
+        const uid = worldInfo.getFreeWorldEntryUid(data);
         if (!Number.isInteger(uid)) {
             throw designerError('designer.entry_uid_exhausted', 'No free world info entry uid is available.');
         }
-        data.entries[uid] = { ...mod.newWorldInfoEntryTemplate, ...normalized };
-        await mod.saveWorldInfo(book, data, true);
+        data.entries[uid] = { ...worldInfo.newWorldInfoEntryTemplate, ...normalized };
+        await worldInfo.saveWorldInfo(book, data, true);
         const rev = await revLock.commit(entryKey(book, uid), data.entries[uid]);
 
         return ok({ book, created: 'entry', uid, rev });
     }
 
     async function update(params = {}) {
-        const mod = await st.loadWorldInfo();
-        const book = requireString(params.book, 'book');
+                const book = requireString(params.book, 'book');
         const uid = requireString(params.uid, 'uid');
-        const data = getBook(mod, book);
+        const data = getBook(book);
         const entry = getEntry(data, book, uid);
 
-        await verifyRevOrThrow(revLock, entryKey(book, uid), params.rev, entry);
+        await verifyUpdateOrThrow(revLock, entryKey(book, uid), params.rev, entry);
 
         // Complete-object contract: every editable entry field that currently
         // holds content is required; missing empty/default fields are
@@ -166,20 +171,19 @@ export function createWorldInfoResource({ st, revLock }) {
         const normalized = normalizeWorldEntryUpdates(completeEntry);
 
         Object.assign(entry, normalized);
-        await mod.saveWorldInfo(book, data, true);
+        await worldInfo.saveWorldInfo(book, data, true);
         const rev = await revLock.commit(entryKey(book, uid), entry);
 
         return ok({ book, uid, updated: Object.keys(normalized), rev });
     }
 
     async function remove(params = {}) {
-        const mod = await st.loadWorldInfo();
-        const book = requireString(params.book, 'book');
-        const data = getBook(mod, book);
+                const book = requireString(params.book, 'book');
+        const data = getBook(book);
 
         if (params.uid === undefined || params.uid === null) {
             await verifyRevOrThrow(revLock, bookKey(book), params.rev, { book, data });
-            const deleted = await mod.deleteWorldInfo(book, { saveLinkedCharacter: false });
+            const deleted = await worldInfo.deleteWorldInfo(book, { saveLinkedCharacter: false });
             if (!deleted) {
                 throw designerError('designer.book_delete_failed', `World info "${book}" could not be deleted.`);
             }
@@ -190,11 +194,11 @@ export function createWorldInfoResource({ st, revLock }) {
         const uid = String(params.uid);
         const entry = getEntry(data, book, uid);
         await verifyRevOrThrow(revLock, entryKey(book, uid), params.rev, entry);
-        const deleted = await mod.deleteWorldInfoEntry(data, uid, { silent: true });
+        const deleted = await worldInfo.deleteWorldInfoEntry(data, uid, { silent: true });
         if (!deleted) {
             throw designerError('designer.entry_delete_failed', `World info entry "${uid}" could not be deleted.`);
         }
-        await mod.saveWorldInfo(book, data, true);
+        await worldInfo.saveWorldInfo(book, data, true);
         revLock.forget(entryKey(book, uid));
         return ok({ book, deleted: 'entry', uid });
     }

@@ -29,11 +29,6 @@ const agentSystemCacheInputs = [
   ...listJavaScriptFiles('src/scripts/tauritavern/agent'),
 ];
 
-const designerCacheInputs = [
-  ...commonCacheInputs,
-  ...listJavaScriptFiles('src/scripts/extensions/designer/src'),
-];
-
 const tauriSettingUiCacheInputs = [
   ...commonCacheInputs,
   ...listJavaScriptFiles('src/scripts/tauri/setting/settings-app'),
@@ -210,31 +205,6 @@ const agentSystemConfig = {
   ],
 };
 
-const designerConfig = {
-  name: 'designer',
-  dependencies: ['vendor-libs'],
-  mode: 'production',
-  bail: true,
-  target: ['web', 'es2020'],
-  cache: createPersistentCache('designer', designerCacheInputs),
-  entry: {
-    index: './src/scripts/extensions/designer/src/index.js',
-  },
-  output: {
-    filename: '[name].bundle.js',
-    path: path.resolve(__dirname, 'src/scripts/extensions/designer/dist'),
-    module: true,
-    library: {
-      type: 'module'
-    },
-    clean: true,
-  },
-  resolve: sharedResolve,
-  optimization: sharedOptimization,
-  performance: sharedPerformance,
-  stats: sharedStats,
-};
-
 const tauriTavernSettingsConfig = {
   name: 'tauritavern-settings',
   dependencies: ['vendor-libs'],
@@ -265,4 +235,4 @@ const tauriTavernSettingsConfig = {
   ],
 };
 
-export default [coreConfig, agentSystemConfig, designerConfig, tauriTavernSettingsConfig];
+export default [coreConfig, agentSystemConfig, tauriTavernSettingsConfig];

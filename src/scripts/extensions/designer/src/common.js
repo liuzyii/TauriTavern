@@ -119,6 +119,27 @@ export async function verifyRevOrThrow(revLock, key, suppliedRev, currentValue) 
     return verified.rev;
 }
 
+/**
+ * Rev gate for update tools: verify the rev, then refuse updates based on a
+ * truncated read (writing a truncated echo back would silently overwrite
+ * content). Delete tools use verifyRevOrThrow only — deletion is identity
+ * based and cannot lose content.
+ * @param {ReturnType<import('./rev-lock.js').createRevLock>} revLock
+ * @param {string} key
+ * @param {unknown} suppliedRev
+ * @param {any} currentValue
+ * @returns {Promise<string>}
+ */
+export async function verifyUpdateOrThrow(revLock, key, suppliedRev, currentValue) {
+    await verifyRevOrThrow(revLock, key, suppliedRev, currentValue);
+    if (revLock.isTruncated(key)) {
+        throw designerError(
+            'designer.truncated_read',
+            'The last read of this object was truncated. Re-read with a larger maxChars and retry with the complete values.',
+        );
+    }
+}
+
 export function normalizeBoolean(value, label) {
     if (typeof value !== 'boolean') {
         throw designerError('designer.invalid_boolean', `${label} must be a boolean.`);
@@ -352,16 +373,11 @@ export function normalizeWorldEntryUpdates(updates) {
         if (value === null || value === undefined) {
             continue;
         }
-        if (key === 'content') {
+        if (key === 'content' || key === 'comment') {
+            const limit = key === 'content' ? WORLD_ENTRY_MAX_CONTENT_LENGTH : WORLD_ENTRY_MAX_COMMENT_LENGTH;
             const text = String(value ?? '');
-            if (text.length > WORLD_ENTRY_MAX_CONTENT_LENGTH) {
-                throw designerError('designer.field_too_long', `content exceeds ${WORLD_ENTRY_MAX_CONTENT_LENGTH} characters.`);
-            }
-            normalized[key] = text;
-        } else if (key === 'comment') {
-            const text = String(value ?? '');
-            if (text.length > WORLD_ENTRY_MAX_COMMENT_LENGTH) {
-                throw designerError('designer.field_too_long', `comment exceeds ${WORLD_ENTRY_MAX_COMMENT_LENGTH} characters.`);
+            if (text.length > limit) {
+                throw designerError('designer.field_too_long', `${key} exceeds ${limit} characters.`);
             }
             normalized[key] = text;
         } else if (key === 'group') {

@@ -70,17 +70,23 @@ export async function fingerprint(value, hash = sha256Hex) {
 export function createRevLock({ hash = sha256Hex } = {}) {
     /** @type {Map<string, string>} */
     const issued = new Map();
+    /** @type {Map<string, {truncated: boolean}>} */
+    const flags = new Map();
 
     /**
      * Issues (or re-issues) a rev for a target and records it in the session
-     * registry. Read tools use this for the values they return.
+     * registry. Read tools use this for the values they return; pass
+     * `truncated: true` when the read result was cut off so updates based on
+     * it can be refused (a truncated echo would silently overwrite data).
      * @param {string} key
      * @param {any} value
+     * @param {{truncated?: boolean}} [options]
      * @returns {Promise<string>}
      */
-    async function issue(key, value) {
+    async function issue(key, value, { truncated = false } = {}) {
         const rev = await fingerprint(value, hash);
         issued.set(key, rev);
+        flags.set(key, { truncated: !!truncated });
         return rev;
     }
 
@@ -115,15 +121,21 @@ export function createRevLock({ hash = sha256Hex } = {}) {
             return {
                 ok: false,
                 code: 'designer.rev_invalid',
-                message: `The supplied rev does not match the rev issued by this session. Use the current rev: ${currentRev}.`,
+                message: `The supplied rev does not match the rev issued by this session. Read the object again to obtain a fresh rev (current rev: ${currentRev}).`,
                 rev: currentRev,
             };
         }
         if (expected !== currentRev) {
+            // The object changed since the rev was issued (e.g. edited in the
+            // UI). Adopt the current fingerprint as the new session rev so the
+            // rev attached to this error message is immediately usable: the
+            // model can retry with it without another read. The write is still
+            // based on the latest state, so the lock's guarantee holds.
+            issued.set(key, currentRev);
             return {
                 ok: false,
                 code: 'designer.rev_mismatch',
-                message: `The object changed since it was last read. Use the current rev: ${currentRev}.`,
+                message: `The object changed since it was last read. Retry with the current rev: ${currentRev}.`,
                 rev: currentRev,
             };
         }
@@ -131,7 +143,9 @@ export function createRevLock({ hash = sha256Hex } = {}) {
     }
 
     /**
-     * Records the new fingerprint of a target after a successful write.
+     * Records the new fingerprint of a target after a successful write. A
+     * post-write state is by definition complete, so the truncated flag is
+     * cleared.
      * @param {string} key
      * @param {any} value
      * @returns {Promise<string>}
@@ -139,6 +153,7 @@ export function createRevLock({ hash = sha256Hex } = {}) {
     async function commit(key, value) {
         const rev = await fingerprint(value, hash);
         issued.set(key, rev);
+        flags.set(key, { truncated: false });
         return rev;
     }
 
@@ -148,7 +163,18 @@ export function createRevLock({ hash = sha256Hex } = {}) {
      */
     function forget(key) {
         issued.delete(key);
+        flags.delete(key);
     }
 
-    return { issue, verify, commit, forget };
+    /**
+     * True when the latest read of the target was truncated. Updates based on
+     * a truncated read are refused to prevent truncated text being written
+     * back over full content.
+     * @param {string} key
+     */
+    function isTruncated(key) {
+        return flags.get(key)?.truncated === true;
+    }
+
+    return { issue, verify, commit, forget, isTruncated };
 }

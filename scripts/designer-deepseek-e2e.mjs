@@ -5,12 +5,21 @@
 // 用法：
 //   DEEPSEEK_API_KEY=sk-xxx node scripts/designer-deepseek-e2e.mjs
 //
+// 可选环境变量：
+//   DESIGNER_E2E_SCENARIO=关键词    只跑标题包含该关键词的场景（省钱/快速迭代）
+//   DESIGNER_E2E_RECURSE_LIMIT=N   镜像 oai_settings.tool_call_recurse_limit
+//                                  （默认 5；UI 1..50，见 #tool_call_recurse_limit）
+//
 // 它模拟 SillyTavern 原生 function-calling 循环：
-//   1. 把 Designer 的 12 个工具定义（与注册进 ToolManager 的完全一致）发送给
+//   1. 把 Designer 的 4 个统一工具定义（与注册进 ToolManager 的完全一致）发送给
 //      DeepSeek chat-completions API（tools + tool_choice:auto）；
 //   2. 模型返回 tool_calls 时，调用我们真实的 action 实现（character/world-info/
 //      prompt 工具 + rev 状态锁），结果以 role:'tool' 消息回填；
 //   3. 循环直到模型输出正文，然后断言沙箱内状态变化是否符合预期。
+//
+// 失败口径：只有「宿主级失败」（未知工具、保存/删除失败等）与场景状态断言失败
+// 才判 FAIL；模型可恢复的错误（rev 锁拒绝、完整对象契约拒绝等）是锁与校验在
+// 正常工作，只作为指标报告，不判失败——否则测试测的是模型完美度而非工具正确性。
 //
 // 不写入任何真实数据：角色卡/世界书/预设都是内存假后端。
 
@@ -27,11 +36,18 @@ async function importDesigner(moduleName) {
 
 const API_URL = 'https://api.deepseek.com/chat/completions';
 const MODEL = 'deepseek-chat';
-// Mirrors ToolManager.RECURSE_LIMIT / oai_settings.tool_call_recurse_limit:
-// in the real app `canPerformToolCalls = ... && depth < RECURSE_LIMIT`
-// (src/script.js:5326), so tools are registered for at most 5 rounds and the
-// next request goes out WITHOUT tools — the model must then finish in text.
-const RECURSE_LIMIT = 5;
+// Mirrors the real ST setting oai_settings.tool_call_recurse_limit: in the
+// app `canPerformToolCalls = ... && depth < ToolManager.RECURSE_LIMIT`
+// (src/script.js:5326). Default is 5; the UI exposes a 1..50 range
+// (#tool_call_recurse_limit). Override with DESIGNER_E2E_RECURSE_LIMIT to
+// validate against a different user setting.
+const RECURSE_LIMIT = Math.min(50, Math.max(1, Number(process.env.DESIGNER_E2E_RECURSE_LIMIT || 5) || 5));
+const SCENARIO_FILTER = process.env.DESIGNER_E2E_SCENARIO ? String(process.env.DESIGNER_E2E_SCENARIO) : null;
+
+/** @param {string} title @returns {boolean} */
+function shouldRunScenario(title) {
+    return !SCENARIO_FILTER || title.includes(SCENARIO_FILTER);
+}
 
 // ---------------------------------------------------------------------------
 // 内存假后端（与 tests/designer-contract.test.mjs 同构，但更接近真实形态）
@@ -177,11 +193,11 @@ function createFakeBackend() {
     const powerUser = { power_user: { sysprompt: { enabled: false, name: '', content: '' } } };
 
     const st = {
-        loadScript: async () => scriptModule,
-        loadWorldInfo: async () => worldInfoModule,
-        loadPresetManager: async () => presetManager,
-        loadSysprompt: async () => sysprompt,
-        loadPowerUser: async () => powerUser,
+        script: scriptModule,
+        worldInfo: worldInfoModule,
+        presetManager,
+        sysprompt,
+        powerUser,
     };
 
     return { st, backend: { characters, worldInfoCache, systemPrompts, fetchImpl } };
@@ -192,7 +208,7 @@ function createFakeBackend() {
 // ---------------------------------------------------------------------------
 
 async function buildTools({ st, fetchImpl }) {
-    const [{ createRevLock }, { buildDesignerTools }, { createCharacterResource }, { createWorldInfoResource }, { createPromptResource }] = await Promise.all([
+    const [{ createRevLock }, { buildUnifiedTools }, { createCharacterResource }, { createWorldInfoResource }, { createPromptResource }] = await Promise.all([
         importDesigner('rev-lock.js'),
         importDesigner('build-tools.js'),
         importDesigner('character-tools.js'),
@@ -200,10 +216,10 @@ async function buildTools({ st, fetchImpl }) {
         importDesigner('prompt-tools.js'),
     ]);
     const revLock = createRevLock();
-    const tools = buildDesignerTools([
-        createCharacterResource({ st, revLock, fetchImpl }),
-        createWorldInfoResource({ st, revLock }),
-        createPromptResource({ st, revLock }),
+    const tools = buildUnifiedTools([
+        createCharacterResource({ script: st.script, revLock, fetchImpl }),
+        createWorldInfoResource({ worldInfo: st.worldInfo, revLock }),
+        createPromptResource({ presetManager: st.presetManager, sysprompt: st.sysprompt, powerUser: st.powerUser, revLock }),
     ]);
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
     const openaiTools = tools.map((t) => ({
@@ -245,6 +261,13 @@ async function callModel(messages, openaiTools) {
     } finally {
         clearTimeout(timer);
     }
+}
+
+/** @param {string} message */
+function isRecoverableError(message) {
+    return /^designer\./.test(message)
+        && !/_failed:/.test(message)
+        && !/crypto_unavailable|context_unavailable/.test(message);
 }
 
 async function runScenario({ title, system, user, byName, openaiTools, stats }) {
@@ -289,12 +312,19 @@ async function runScenario({ title, system, user, byName, openaiTools, stats }) 
                     }
                     const result = await action(args);
                     content = JSON.stringify(result);
-                    stats.calls.push({ name, args, result, ok: true });
+                    stats.calls.push({ name, args, result, ok: true, recoverable: false });
                 } catch (error) {
-                    content = `Error: ${error.message}`;
-                    stats.calls.push({ name, args, error: error.message, ok: false });
-                    if (String(error.message).includes('designer.rev_')) {
+                    const errorMessage = String(error.message || error);
+                    content = `Error: ${errorMessage}`;
+                    const recoverable = isRecoverableError(errorMessage);
+                    stats.calls.push({ name, args, error: errorMessage, ok: false, recoverable });
+                    if (errorMessage.includes('designer.rev_')) {
                         stats.revRejections += 1;
+                    }
+                    if (recoverable) {
+                        stats.recoverableErrors += 1;
+                    } else {
+                        stats.hostFailures += 1;
                     }
                 }
                 console.log(`\n[round ${depth + 1}] ${name}(${JSON.stringify(args)})`);
@@ -313,7 +343,7 @@ async function runScenario({ title, system, user, byName, openaiTools, stats }) 
 }
 
 // ---------------------------------------------------------------------------
-// 断言
+// 断言与场景过滤
 // ---------------------------------------------------------------------------
 
 function assert(condition, label, detail) {
@@ -321,6 +351,19 @@ function assert(condition, label, detail) {
         throw new Error(`断言失败：${label}${detail ? `\n  ${detail}` : ''}`);
     }
     console.log(`  ✔ ${label}`);
+}
+
+/**
+ * Runs a scenario block only when it matches DESIGNER_E2E_SCENARIO (if set).
+ * @param {string} title
+ * @param {() => Promise<void>} fn
+ */
+async function scenario(title, fn) {
+    if (!shouldRunScenario(title)) {
+        console.log(`[skip] ${title}`);
+        return;
+    }
+    await fn();
 }
 
 // ---------------------------------------------------------------------------
@@ -336,166 +379,205 @@ async function main() {
     const { byName, openaiTools } = await buildTools({ st, fetchImpl: backend.fetchImpl });
     const { DESIGNER_GUIDANCE } = await importDesigner('guidance.js');
 
-    const stats = { calls: [], revRejections: 0, promptTokens: 0, completionTokens: 0 };
+    console.log(`[designer-e2e] RECURSE_LIMIT=${RECURSE_LIMIT}${SCENARIO_FILTER ? `，SCENARIO_FILTER="${SCENARIO_FILTER}"` : ''}`);
+    const stats = {
+        calls: [],
+        revRejections: 0,
+        recoverableErrors: 0,
+        hostFailures: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+    };
     const perception = {};
+    const snapshotCalls = () => stats.calls.slice();
+    const scenarioToolCalls = (before) => stats.calls.slice(before.length).map((c) => c.name);
 
-    // ---- 机制场景 A：角色卡设计 -----------------------------------------------
-    await runScenario({
-        title: '角色卡：新建 + 读取 + 修改',
-        system: 'You are a character design assistant inside a sandbox. Use the provided tools to fulfill the user request. Always read an object before modifying it and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result. Changes apply immediately.',
-        user: '请帮我创建一位叫 Mira 的流浪占卜师角色卡：包含描述（一位流浪的占卜师，用塔罗牌为旅人指引）、性格（神秘、敏锐）、开场白。创建后读取一下确认，然后给她的卡加上深度提示（prompt 聚焦于塔罗占卜场景，depth=2，role=system）。另外把现有角色 Ada 的描述改成 "A quiet librarian who now also catalogs tarot decks."。',
-        byName,
-        openaiTools,
-        stats,
+    // ---- 机制场景 A：角色卡设计 ---------------------------------------------
+    await scenario('角色卡：新建 + 读取 + 修改', async () => {
+        await runScenario({
+            title: '角色卡：新建 + 读取 + 修改',
+            system: 'You are a character design assistant inside a sandbox. Use the provided tools to fulfill the user request. Always read an object before modifying it and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result. Changes apply immediately.',
+            user: '请帮我创建一位叫 Mira 的流浪占卜师角色卡：包含描述（一位流浪的占卜师，用塔罗牌为旅人指引）、性格（神秘、敏锐）、开场白。创建后读取一下确认，然后给她的卡加上深度提示（prompt 聚焦于塔罗占卜场景，depth=2，role=system）。另外把现有角色 Ada 的描述改成 "A quiet librarian who now also catalogs tarot decks."。',
+            byName,
+            openaiTools,
+            stats,
+        });
+        const mira = backend.characters.find((c) => String(c.name || '').includes('Mira'));
+        assert(Boolean(mira), 'Mira 角色卡已创建', JSON.stringify(backend.characters.map((c) => c.name)));
+        assert(String(mira.data.description || '').length > 10, 'Mira 描述非空');
+        assert(Boolean(mira.data.extensions?.depth_prompt), 'Mira 深度提示已设置', JSON.stringify(mira.data.extensions));
+        const ada = backend.characters.find((c) => c.avatar === 'ada.png');
+        assert(String(ada.data.description || '').includes('tarot'), 'Ada 描述已更新', ada.data.description);
     });
-    const mira = backend.characters.find((c) => String(c.name || '').includes('Mira'));
-    assert(Boolean(mira), 'Mira 角色卡已创建', JSON.stringify(backend.characters.map((c) => c.name)));
-    assert(String(mira.data.description || '').length > 10, 'Mira 描述非空');
-    assert(Boolean(mira.data.extensions?.depth_prompt), 'Mira 深度提示已设置', JSON.stringify(mira.data.extensions));
-    const ada = backend.characters.find((c) => c.avatar === 'ada.png');
-    assert(String(ada.data.description || '').includes('tarot'), 'Ada 描述已更新', ada.data.description);
 
     // ---- 场景 B：世界书 -----------------------------------------------------
-    await runScenario({
-        title: '世界书：建书 + 建条目 + 改条目',
-        system: 'You are a world-building assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result.',
-        user: '请为 Mira 创建一本名为 "Mira\'s World" 的世界书，并添加两条条目：一条关键字是 ["tarot_fair"]，内容是 "The Tarot Fair visits every new moon."，comment 写 "占卜集市"；另一条关键字是 ["tower_card"]，内容是塔罗牌"高塔"在故事里的含义。然后读取这本书确认条目，再修改第一条的内容为 "The Tarot Fair visits every new moon, and Mira always has a stall."。',
-        byName,
-        openaiTools,
-        stats,
+    await scenario('世界书：建书 + 建条目 + 改条目', async () => {
+        await runScenario({
+            title: '世界书：建书 + 建条目 + 改条目',
+            system: 'You are a world-building assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result.',
+            user: '请为 Mira 创建一本名为 "Mira\'s World" 的世界书，并添加两条条目：一条关键字是 ["tarot_fair"]，内容是 "The Tarot Fair visits every new moon."，comment 写 "占卜集市"；另一条关键字是 ["tower_card"]，内容是塔罗牌"高塔"在故事里的含义。然后读取这本书确认条目，再修改第一条的内容为 "The Tarot Fair visits every new moon, and Mira always has a stall."。',
+            byName,
+            openaiTools,
+            stats,
+        });
+        const book = backend.worldInfoCache.get("Mira's World");
+        assert(Boolean(book), '世界书 "Mira\'s World" 已创建', [...backend.worldInfoCache.keys()].join(', '));
+        const entries = Object.values(book.entries || {});
+        assert(entries.length >= 2, `世界书条目数 >= 2（实际 ${entries.length}）`);
+        const fair = entries.find((e) => Array.isArray(e.key) && e.key.includes('tarot_fair'));
+        assert(Boolean(fair), 'tarot_fair 条目存在');
+        assert(String(fair.content || '').includes('always has a stall'), 'tarot_fair 条目内容已更新', fair.content);
     });
-    const book = backend.worldInfoCache.get("Mira's World");
-    assert(Boolean(book), '世界书 "Mira\'s World" 已创建', [...backend.worldInfoCache.keys()].join(', '));
-    const entries = Object.values(book.entries || {});
-    assert(entries.length >= 2, `世界书条目数 >= 2（实际 ${entries.length}）`);
-    const fair = entries.find((e) => Array.isArray(e.key) && e.key.includes('tarot_fair'));
-    assert(Boolean(fair), 'tarot_fair 条目存在');
-    assert(String(fair.content || '').includes('always has a stall'), 'tarot_fair 条目内容已更新', fair.content);
 
     // ---- 场景 C：系统提示词 -------------------------------------------------
-    await runScenario({
-        title: '系统提示词：新建 + 读取 + 修改',
-        system: 'You are an assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result.',
-        user: '请创建一个名为 "Design Session" 的系统提示词预设，内容为 "You are helping the user design a story setting."。读取确认后，把它的内容更新为 "You are helping the user design a story setting with consistent world rules."。',
-        byName,
-        openaiTools,
-        stats,
+    await scenario('系统提示词：新建 + 读取 + 修改', async () => {
+        await runScenario({
+            title: '系统提示词：新建 + 读取 + 修改',
+            system: 'You are an assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result.',
+            user: '请创建一个名为 "Design Session" 的系统提示词预设，内容为 "You are helping the user design a story setting."。读取确认后，把它的内容更新为 "You are helping the user design a story setting with consistent world rules."。',
+            byName,
+            openaiTools,
+            stats,
+        });
+        const preset = backend.systemPrompts.find((p) => p.name === 'Design Session');
+        assert(Boolean(preset), 'Design Session 预设已创建', JSON.stringify(backend.systemPrompts.map((p) => p.name)));
+        assert(String(preset.content || '').includes('consistent world rules'), '预设内容已更新', preset.content);
     });
-    const preset = backend.systemPrompts.find((p) => p.name === 'Design Session');
-    assert(Boolean(preset), 'Design Session 预设已创建', JSON.stringify(backend.systemPrompts.map((p) => p.name)));
-    assert(String(preset.content || '').includes('consistent world rules'), '预设内容已更新', preset.content);
 
     // ==========================================================================
     // 感知场景：模型能否自发感知并正确使用工具（用户消息均为自然语言，不提示工具）
     // ==========================================================================
 
-    const snapshotCalls = () => stats.calls.slice();
-    const scenarioToolCalls = (before) => stats.calls.slice(before.length).map((c) => c.name);
-
     // P1：真实引导文案 + 角色卡已在上下文中（同真实 Prompt 组装）+ 自然语言修改意图
-    const adaCardForP1 = backend.characters.find((c) => c.avatar === 'ada.png').data;
-    const adaBefore = String(adaCardForP1.description || '');
-    const beforeP1 = snapshotCalls();
-    await runScenario({
-        title: '感知P1：真实引导文案 + 自然语言（改角色卡）',
-        system: `You are a character design assistant. The active character card is: ${JSON.stringify(adaCardForP1)}. ` + DESIGNER_GUIDANCE,
-        user: '帮我把 Ada 的角色卡改一下：她其实暗中收藏塔罗牌，把这一点写进她的描述里。',
-        byName,
-        openaiTools,
-        stats,
-    });
-    {
+    await scenario('感知P1：真实引导文案 + 自然语言（改角色卡）', async () => {
+        const adaCardForP1 = backend.characters.find((c) => c.avatar === 'ada.png').data;
+        const adaBefore = String(adaCardForP1.description || '');
+        const beforeP1 = snapshotCalls();
+        await runScenario({
+            title: '感知P1：真实引导文案 + 自然语言（改角色卡）',
+            system: `You are a character design assistant. The active character card is: ${JSON.stringify(adaCardForP1)}. ` + DESIGNER_GUIDANCE,
+            user: '帮我把 Ada 的角色卡改一下：她其实暗中收藏塔罗牌，把这一点写进她的描述里。',
+            byName,
+            openaiTools,
+            stats,
+        });
         const calls = scenarioToolCalls(beforeP1);
         perception.p1 = calls;
-        const updateIndex = calls.indexOf('update_character');
-        assert(updateIndex >= 0, 'P1：模型自发调用 update_character', calls.join(', '));
-        assert(calls.slice(0, updateIndex).includes('read_character'), 'P1：update 之前先 read（感知先读后改）', calls.join(', '));
+        const updateIndex = calls.indexOf('update');
+        assert(updateIndex >= 0, 'P1：模型自发调用 update（target=character）', calls.join(', '));
+        assert(calls.slice(0, updateIndex).includes('read'), 'P1：update 之前先 read（感知先读后改）', calls.join(', '));
         const adaNow = String(backend.characters.find((c) => c.avatar === 'ada.png').data.description || '');
         assert(adaNow !== adaBefore && adaNow.length > adaBefore.length, 'P1：Ada 描述已被模型修改', adaNow);
         const adaTags = backend.characters.find((c) => c.avatar === 'ada.png').data.tags;
         assert(Array.isArray(adaTags) && adaTags.includes('librarian'), 'P1：tags 未被清空（数组原样契约）', JSON.stringify(adaTags));
-    }
+    });
 
     // P2：无引导文案（仅工具定义）-> 模型是否仅凭 description 感知到工具
-    const beforeP2 = snapshotCalls();
-    await runScenario({
-        title: '感知P2：无引导文案 + 自然语言（建世界书）',
-        system: 'You are a helpful assistant.',
-        user: '我想给这个虚构世界添加一本名为 "Moon & Tides" 的世界书，里面加一条关键字为 ["moon_tides"] 的条目，内容写月相与潮汐的关系。',
-        byName,
-        openaiTools,
-        stats,
-    });
-    {
+    await scenario('感知P2：无引导文案 + 自然语言（建世界书）', async () => {
+        const beforeP2 = snapshotCalls();
+        await runScenario({
+            title: '感知P2：无引导文案 + 自然语言（建世界书）',
+            system: 'You are a helpful assistant.',
+            user: '我想给这个虚构世界添加一本名为 "Moon & Tides" 的世界书，里面加一条关键字为 ["moon_tides"] 的条目，内容写月相与潮汐的关系。',
+            byName,
+            openaiTools,
+            stats,
+        });
         const calls = scenarioToolCalls(beforeP2);
         perception.p2 = calls;
         assert(calls.includes('create_world_info'), 'P2：无引导时模型仍凭工具描述自发调用 create_world_info', calls.join(', ') || '（未调用任何工具）');
         assert(Boolean(backend.worldInfoCache.get('Moon & Tides')), 'P2：世界书 "Moon & Tides" 已创建');
-    }
+    });
 
     // P3：负面纪律——真实人设 + 引导文案，纯 RP 对话不应触发任何工具
-    const beforeP3 = snapshotCalls();
-    await runScenario({
-        title: '感知P3：负面纪律（纯 RP 对话不应调工具）',
-        system: 'You are Ada, a quiet librarian in a fantasy tavern who secretly collects tarot cards. Reply in character as Ada; the user has just greeted you in the archive at night. ' + DESIGNER_GUIDANCE,
-        user: 'Ada 从柜台后抬起头，微笑着说："又来了？今晚档案馆很安静，只有风在翻书页。"',
-        byName,
-        openaiTools,
-        stats,
-    });
-    {
+    await scenario('感知P3：负面纪律（纯 RP 对话不应调工具）', async () => {
+        const beforeP3 = snapshotCalls();
+        await runScenario({
+            title: '感知P3：负面纪律（纯 RP 对话不应调工具）',
+            system: 'You are Ada, a quiet librarian in a fantasy tavern who secretly collects tarot cards. Reply in character as Ada; the user has just greeted you in the archive at night. ' + DESIGNER_GUIDANCE,
+            user: 'Ada 从柜台后抬起头，微笑着说："又来了？今晚档案馆很安静，只有风在翻书页。"',
+            byName,
+            openaiTools,
+            stats,
+        });
         const calls = scenarioToolCalls(beforeP3);
         perception.p3 = calls;
         assert(calls.length === 0, 'P3：RP 对话中模型未调用任何工具', calls.join(', ') || '（无工具调用，符合纪律）');
-    }
+    });
 
     // P4：隐含设计意图（用户只表达不满，未提工具/对象名）-> 模型应主动读世界书并修改
-    const fairBefore = String(Object.values(backend.worldInfoCache.get("Mira's World").entries)
-        .find((e) => Array.isArray(e.key) && e.key.includes('tarot_fair')).content || '');
-    const beforeP4 = snapshotCalls();
-    await runScenario({
-        title: '感知P4：隐含意图（世界书内容要改）',
-        system: DESIGNER_GUIDANCE,
-        user: '我觉得 "Mira\'s World" 里占卜集市的内容不太对，占卜集市应该改成每逢满月才出现。',
-        byName,
-        openaiTools,
-        stats,
-    });
-    {
+    await scenario('感知P4：隐含意图（世界书内容要改）', async () => {
+        // Self-contained: seed the book when P4 runs alone (filtered mode).
+        if (!backend.worldInfoCache.has("Mira's World")) {
+            backend.worldInfoCache.set("Mira's World", {
+                entries: {
+                    0: {
+                        key: ['tarot_fair'],
+                        keysecondary: [],
+                        comment: '占卜集市',
+                        content: 'The Tarot Fair visits every new moon, and Mira always has a stall.',
+                        constant: false,
+                        selective: true,
+                        disable: false,
+                        order: 100,
+                        position: 0,
+                        excludeRecursion: false,
+                        preventRecursion: false,
+                        delayUntilRecursion: 0,
+                        depth: 4,
+                        group: '',
+                        vectorized: false,
+                        role: 0,
+                        triggers: [],
+                    },
+                },
+            });
+        }
+        const fairBefore = String(Object.values(backend.worldInfoCache.get("Mira's World").entries)
+            .find((e) => Array.isArray(e.key) && e.key.includes('tarot_fair')).content || '');
+        const beforeP4 = snapshotCalls();
+        await runScenario({
+            title: '感知P4：隐含意图（世界书内容要改）',
+            system: DESIGNER_GUIDANCE,
+            user: '我觉得 "Mira\'s World" 里占卜集市的内容不太对，占卜集市应该改成每逢满月才出现。',
+            byName,
+            openaiTools,
+            stats,
+        });
         const calls = scenarioToolCalls(beforeP4);
         perception.p4 = calls;
-        const updateIndex = calls.indexOf('update_world_info');
+        const updateIndex = calls.indexOf('update');
         assert(updateIndex >= 0, 'P4：模型自发调用 update_world_info', calls.join(', '));
-        assert(calls.slice(0, updateIndex).some((name) => name === 'read_world_info'), 'P4：修改前先读世界书', calls.join(', '));
+        assert(calls.slice(0, updateIndex).some((name) => name === 'read'), 'P4：修改前先读世界书', calls.join(', '));
         const fairNow = String(Object.values(backend.worldInfoCache.get("Mira's World").entries)
             .find((e) => Array.isArray(e.key) && e.key.includes('tarot_fair')).content || '');
         assert(fairNow !== fairBefore, 'P4：tarot_fair 条目内容已被模型修改', fairNow);
-    }
+    });
 
     // ---- 汇总 --------------------------------------------------------------
-    const failedCalls = stats.calls.filter((c) => !c.ok);
     const toolNames = [...new Set(stats.calls.map((c) => c.name))];
     console.log(`\n${'='.repeat(70)}\n测试汇总\n${'='.repeat(70)}`);
     console.log(`工具调用总数：${stats.calls.length}（${toolNames.join(', ')}）`);
-    console.log(`失败调用：${failedCalls.length}`);
-    console.log(`rev 锁拒绝次数：${stats.revRejections}`);
+    console.log(`宿主级失败：${stats.hostFailures}`);
+    console.log(`可恢复模型错误：${stats.recoverableErrors}（其中 rev 锁拒绝 ${stats.revRejections} 次）`);
     console.log(`token 用量：prompt ${stats.promptTokens} / completion ${stats.completionTokens}`);
     console.log(`\n感知测试结果：`);
-    console.log(`  P1 真实引导+自然语言（改角色卡）    -> ${perception.p1.join(' → ') || '未调用工具'}`);
-    console.log(`  P2 无引导仅工具描述（建世界书）      -> ${perception.p2.join(' → ') || '未调用工具'}`);
-    console.log(`  P3 纯 RP 对话（负面纪律）            -> ${perception.p3.length === 0 ? '未调用工具 ✔' : perception.p3.join(', ') + ' ⚠️'}`);
-    console.log(`  P4 隐含意图（改世界书内容）          -> ${perception.p4.join(' → ') || '未调用工具'}`);
-    if (failedCalls.length > 0) {
-        console.log('失败明细：');
-        for (const call of failedCalls) {
+    console.log(`  P1 真实引导+自然语言（改角色卡）    -> ${(perception.p1 ?? []).join(' → ') || '未调用工具'}`);
+    console.log(`  P2 无引导仅工具描述（建世界书）      -> ${(perception.p2 ?? []).join(' → ') || '未调用工具'}`);
+    console.log(`  P3 纯 RP 对话（负面纪律）            -> ${(perception.p3 ?? []).length === 0 ? '未调用工具 ✔' : perception.p3.join(', ') + ' ⚠️'}`);
+    console.log(`  P4 隐含意图（改世界书内容）          -> ${(perception.p4 ?? []).join(' → ') || '未调用工具'}`);
+    const recoverableCalls = stats.calls.filter((c) => !c.ok && c.recoverable);
+    if (recoverableCalls.length > 0) {
+        console.log('可恢复错误明细（锁与校验正常工作，模型自纠即可，不计失败）：');
+        for (const call of recoverableCalls) {
             console.log(`  - ${call.name}(${JSON.stringify(call.args)}): ${call.error}`);
         }
     }
     if (stats.revRejections > 0) {
-        console.log('⚠️ 提示：出现 rev 锁拒绝，说明模型使用了过期 rev（已通过错误信息自纠或未自纠，见上）');
+        console.log('ℹ️ rev 锁拒绝是预期保护机制（过期/外部修改被拦截），非缺陷。');
     }
-    assert(stats.revRejections === 0, '无 rev 锁拒绝（模型始终基于最新状态）');
-    assert(failedCalls.length === 0, '无失败工具调用');
+
+    assert(stats.hostFailures === 0, '无宿主级失败');
 
     console.log('\n✅ 全部端到端断言通过');
 }

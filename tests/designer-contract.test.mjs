@@ -1,9 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+test('designer extension is registered in the system extension allowlist', async () => {
+    // The Tauri backend only reports bundled extensions listed in
+    // ENABLED_SYSTEM_EXTENSIONS; a missing entry silently prevents the whole
+    // extension from loading (and therefore from registering any tools).
+    const sourcePath = path.join(
+        REPO_ROOT,
+        'src-tauri/crates/tt-adapter-extension/src/repositories/file_extension_repository.rs',
+    );
+    const source = await readFile(sourcePath, 'utf8');
+    const marker = 'ENABLED_SYSTEM_EXTENSIONS: &[&str] = &[';
+    const start = source.indexOf(marker);
+    assert.ok(start >= 0, '未找到 ENABLED_SYSTEM_EXTENSIONS 数组');
+    const end = source.indexOf('];', start);
+    const list = source.slice(start + marker.length, end);
+    assert.ok(list.includes('"designer"'), 'designer 必须在 ENABLED_SYSTEM_EXTENSIONS 白名单中，否则应用不会加载该扩展');
+});
 
 async function importFresh(relativePath) {
     const modulePath = path.join(REPO_ROOT, relativePath);
@@ -132,11 +150,11 @@ function createFakePromptModules({ presets = [] } = {}) {
 
 function fakeSt({ scriptModule, worldInfoModule, promptModules }) {
     return {
-        loadScript: async () => scriptModule,
-        loadWorldInfo: async () => worldInfoModule,
-        loadPresetManager: async () => promptModules.presetManager,
-        loadSysprompt: async () => promptModules.sysprompt,
-        loadPowerUser: async () => promptModules.powerUser,
+        script: scriptModule,
+        worldInfo: worldInfoModule,
+        presetManager: promptModules.presetManager,
+        sysprompt: promptModules.sysprompt,
+        powerUser: promptModules.powerUser,
     };
 }
 
@@ -173,6 +191,10 @@ test('rev-lock: issue, verify, commit and forget lifecycle', async () => {
     assert.equal(mismatch.ok, false);
     assert.equal(mismatch.code, 'designer.rev_mismatch');
     assert.equal(mismatch.rev, await fingerprint(changed));
+    // The mismatch error adopts the current fingerprint, so the attached rev
+    // is immediately usable: retrying with it succeeds without another read.
+    const retryAfterMismatch = await lock.verify('k', mismatch.rev, changed);
+    assert.equal(retryAfterMismatch.ok, true);
 
     const nextRev = await lock.commit('k', changed);
     assert.equal(nextRev, mismatch.rev);
@@ -182,6 +204,15 @@ test('rev-lock: issue, verify, commit and forget lifecycle', async () => {
     lock.forget('k');
     const forgotten = await lock.verify('k', nextRev, changed);
     assert.equal(forgotten.code, 'designer.rev_unknown');
+
+    // Truncated-read flag lifecycle
+    await lock.issue('t', value, { truncated: true });
+    assert.equal(lock.isTruncated('t'), true);
+    await lock.commit('t', changed);
+    assert.equal(lock.isTruncated('t'), false);
+    await lock.issue('t2', value, { truncated: true });
+    lock.forget('t2');
+    assert.equal(lock.isTruncated('t2'), false);
 });
 
 test('common: character update whitelist and payload builders', async () => {
@@ -239,9 +270,9 @@ test('common: world entry whitelist and truncation', async () => {
     assert.equal(common.truncateText('abcdef', 3), 'abc…[truncated 3 chars]');
 });
 
-test('designer tools: 12 lowercase verb-first CRUD definitions', async () => {
+test('designer tools: 4 unified lowercase CRUD tools with target dispatch', async () => {
     const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildDesignerTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
     const { createCharacterResource } = await importFresh('src/scripts/extensions/designer/src/character-tools.js');
     const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/src/world-info-tools.js');
     const { createPromptResource } = await importFresh('src/scripts/extensions/designer/src/prompt-tools.js');
@@ -253,33 +284,31 @@ test('designer tools: 12 lowercase verb-first CRUD definitions', async () => {
     });
     const revLock = createRevLock();
 
-    const tools = buildDesignerTools([
-        createCharacterResource({ st, revLock }),
-        createWorldInfoResource({ st, revLock }),
-        createPromptResource({ st, revLock }),
+    const tools = buildUnifiedTools([
+        createCharacterResource({ script: st.script, revLock }),
+        createWorldInfoResource({ worldInfo: st.worldInfo, revLock }),
+        createPromptResource({ presetManager: st.presetManager, sysprompt: st.sysprompt, powerUser: st.powerUser, revLock }),
     ]);
 
-    assert.deepEqual(
-        tools.map((t) => t.name),
-        [
-            'read_character', 'create_character', 'update_character', 'delete_character',
-            'read_world_info', 'create_world_info', 'update_world_info', 'delete_world_info',
-            'read_prompt', 'create_prompt', 'update_prompt', 'delete_prompt',
-        ],
-    );
+    assert.deepEqual(tools.map((t) => t.name), ['read', 'create', 'update', 'delete']);
     for (const tool of tools) {
-        assert.match(tool.name, /^(read|create|update|delete)_/);
         assert.equal(tool.name, tool.name.toLowerCase());
         assert.equal(typeof tool.description, 'string');
+        assert.equal(tool.description.length > 100, true);
         assert.equal(typeof tool.parameters, 'object');
+        assert.deepEqual(tool.parameters.required, ['target']);
+        assert.deepEqual(tool.parameters.properties.target.enum, ['character', 'world_info', 'prompt']);
         assert.equal(typeof tool.action, 'function');
         assert.equal(typeof tool.formatMessage, 'function');
         assert.equal(tool.shouldRegister(), true);
     }
+
+    // Dispatch rejects unknown targets with a recoverable error
+    await assert.rejects(tools[0].action({ target: 'nobody' }), /designer\.unknown_target/);
 });
 
-test('designer tools: adding a resource adapter extends the tool set uniformly', async () => {
-    const { buildDesignerTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+test('designer tools: adding a resource adapter extends the target enum uniformly', async () => {
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
 
     const personaResource = {
         name: 'persona',
@@ -288,8 +317,9 @@ test('designer tools: adding a resource adapter extends the tool set uniformly',
             create: { action: async () => ({}), description: 'create personas', parameters: { type: 'object', properties: {} } },
         },
     };
-    const tools = buildDesignerTools([personaResource]);
-    assert.deepEqual(tools.map((t) => t.name), ['read_persona', 'create_persona']);
+    const tools = buildUnifiedTools([personaResource]);
+    assert.deepEqual(tools.map((t) => t.name), ['read', 'create']);
+    assert.deepEqual(tools[0].parameters.properties.target.enum, ['persona']);
     for (const tool of tools) {
         assert.equal(typeof tool.action, 'function');
         assert.equal(typeof tool.description, 'string');
@@ -340,7 +370,7 @@ function fullEntry(overrides = {}) {
 
 test('character tools: read, update with rev lock, create, delete', async () => {
     const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildDesignerTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
     const { createCharacterResource } = await importFresh('src/scripts/extensions/designer/src/character-tools.js');
 
     const characters = [
@@ -368,18 +398,18 @@ test('character tools: read, update with rev lock, create, delete', async () => 
         worldInfoModule: createFakeWorldInfoModule(),
         promptModules: createFakePromptModules(),
     });
-    const tools = buildDesignerTools([
-        createCharacterResource({ st, revLock: createRevLock(), fetchImpl: fetchHarness.fetchImpl }),
+    const tools = buildUnifiedTools([
+        createCharacterResource({ script: st.script, revLock: createRevLock(), fetchImpl: fetchHarness.fetchImpl }),
     ]);
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
 
     // List mode
-    const list = await byName.read_character({});
+    const list = await byName.read({ target: 'character',});
     assert.equal(list.ok, true);
     assert.deepEqual(list.characters, [{ avatar: 'a1.png', name: 'Ada' }]);
 
     // Read detail issues a rev
-    const read = await byName.read_character({ avatar: 'a1.png' });
+    const read = await byName.read({ target: 'character', avatar: 'a1.png' });
     assert.equal(read.ok, true);
     assert.equal(read.rev.length > 0, true);
     assert.equal(read.fields.description, 'hello');
@@ -387,25 +417,25 @@ test('character tools: read, update with rev lock, create, delete', async () => 
     assert.equal(read.truncated, false);
 
     // Case-insensitive avatar and name fallback (models mis-guess ids)
-    const looseRead = await byName.read_character({ avatar: 'A1.PNG' });
+    const looseRead = await byName.read({ target: 'character', avatar: 'A1.PNG' });
     assert.equal(looseRead.ok, true);
     assert.equal(looseRead.avatar, 'a1.png');
-    const nameRead = await byName.read_character({ avatar: 'Ada' });
+    const nameRead = await byName.read({ target: 'character', avatar: 'Ada' });
     assert.equal(nameRead.ok, true);
     assert.equal(nameRead.avatar, 'a1.png');
     await assert.rejects(
-        byName.read_character({ avatar: 'nobody' }),
+        byName.read({ target: 'character', avatar: 'nobody' }),
         /designer\.character_not_found/,
     );
 
     // Partial cards are rejected when non-empty fields are missing
     await assert.rejects(
-        byName.update_character({ avatar: 'a1.png', rev: read.rev, card: { description: 'only this' } }),
+        byName.update({ target: 'character', avatar: 'a1.png', rev: read.rev, card: { description: 'only this' } }),
         /designer\.incomplete_update/,
     );
 
     // Update with the issued rev requires the COMPLETE card
-    const updated = await byName.update_character({ avatar: 'a1.png', rev: read.rev, card: fullAdaCard({ description: 'brave' }) });
+    const updated = await byName.update({ target: 'character', avatar: 'a1.png', rev: read.rev, card: fullAdaCard({ description: 'brave' }) });
     assert.equal(updated.ok, true);
     assert.ok(updated.updated.includes('description'));
     const mergeRequest = fetchHarness.requests.find((r) => r.url === '/api/characters/merge-attributes');
@@ -415,11 +445,11 @@ test('character tools: read, update with rev lock, create, delete', async () => 
     assert.equal(mergeBody.data.personality, 'dry humor', '未改字段也必须随完整对象提交');
 
     // Missing empty/default fields are auto-filled from the current card
-    const freshForAutoFill = await byName.read_character({ avatar: 'a1.png' });
+    const freshForAutoFill = await byName.read({ target: 'character', avatar: 'a1.png' });
     const cardWithoutEmptyFields = fullAdaCard({ description: 'brave again' });
     delete cardWithoutEmptyFields.scenario;
     delete cardWithoutEmptyFields.world;
-    const autoFilled = await byName.update_character({ avatar: 'a1.png', rev: freshForAutoFill.rev, card: cardWithoutEmptyFields });
+    const autoFilled = await byName.update({ target: 'character', avatar: 'a1.png', rev: freshForAutoFill.rev, card: cardWithoutEmptyFields });
     assert.equal(autoFilled.ok, true);
     const mergeRequests = fetchHarness.requests.filter((r) => r.url === '/api/characters/merge-attributes');
     const autoFillBody = JSON.parse(mergeRequests.at(-1).options.body);
@@ -427,37 +457,49 @@ test('character tools: read, update with rev lock, create, delete', async () => 
     assert.equal(autoFillBody.data.extensions.world, '', '缺失的默认 extensions 字段自动沿用旧值');
 
     // Explicit null means "keep the current value" (models emit null habitually)
-    const freshForNull = await byName.read_character({ avatar: 'a1.png' });
+    const freshForNull = await byName.read({ target: 'character', avatar: 'a1.png' });
     const cardWithNull = fullAdaCard({ description: null, depth_prompt: null });
-    const nullUpdated = await byName.update_character({ avatar: 'a1.png', rev: freshForNull.rev, card: cardWithNull });
+    const nullUpdated = await byName.update({ target: 'character', avatar: 'a1.png', rev: freshForNull.rev, card: cardWithNull });
     assert.equal(nullUpdated.ok, true);
     const nullBody = JSON.parse(fetchHarness.requests.filter((r) => r.url === '/api/characters/merge-attributes').at(-1).options.body);
     assert.equal('description' in nullBody.data, false, 'null 字段不参与更新（保持当前值）');
     assert.equal('depth_prompt' in nullBody.data.extensions, false, 'null 的 depth_prompt 不参与更新');
 
+    // Truncated read blocks updates until the object is re-read in full
+    const truncatedRead = await byName.read({ target: 'character', avatar: 'a1.png', maxChars: 3 });
+    assert.equal(truncatedRead.truncated, true);
+    await assert.rejects(
+        byName.update({ target: 'character', avatar: 'a1.png', rev: truncatedRead.rev, card: fullAdaCard({ description: 'x' }) }),
+        /designer\.truncated_read/,
+    );
+    const fullRead = await byName.read({ target: 'character', avatar: 'a1.png' });
+    assert.equal(fullRead.truncated, false);
+    const afterFullRead = await byName.update({ target: 'character', avatar: 'a1.png', rev: fullRead.rev, card: fullAdaCard({ description: 'ok' }) });
+    assert.equal(afterFullRead.ok, true);
+
     // Stale rev (superseded by our own update) fails with rev_invalid
     await assert.rejects(
-        byName.update_character({ avatar: 'a1.png', rev: read.rev, card: fullAdaCard({ description: 'again' }) }),
+        byName.update({ target: 'character', avatar: 'a1.png', rev: read.rev, card: fullAdaCard({ description: 'again' }) }),
         /designer\.rev_invalid/,
     );
 
     // External change after a fresh read fails with rev_mismatch
-    const externalRead = await byName.read_character({ avatar: 'a1.png' });
+    const externalRead = await byName.read({ target: 'character', avatar: 'a1.png' });
     characters[0].data.description = 'externally edited';
     await assert.rejects(
-        byName.update_character({ avatar: 'a1.png', rev: externalRead.rev, card: fullAdaCard({ description: 'x' }) }),
+        byName.update({ target: 'character', avatar: 'a1.png', rev: externalRead.rev, card: fullAdaCard({ description: 'x' }) }),
         /designer\.rev_mismatch/,
     );
 
     // Unknown field fails
-    const freshRead = await byName.read_character({ avatar: 'a1.png' });
+    const freshRead = await byName.read({ target: 'character', avatar: 'a1.png' });
     await assert.rejects(
-        byName.update_character({ avatar: 'a1.png', rev: freshRead.rev, card: fullAdaCard({ extensions: {} }) }),
+        byName.update({ target: 'character', avatar: 'a1.png', rev: freshRead.rev, card: fullAdaCard({ extensions: {} }) }),
         /designer\.unknown_field/,
     );
 
     // Create posts to the JSON create route and returns a rev
-    const created = await byName.create_character({ card: { name: 'Bob', description: 'strong' } });
+    const created = await byName.create({ target: 'character', card: { name: 'Bob', description: 'strong' } });
     assert.equal(created.ok, true);
     assert.equal(created.avatar, 'a2.png');
     const createRequest = fetchHarness.requests.find((r) => r.url === '/api/characters/create');
@@ -467,21 +509,21 @@ test('character tools: read, update with rev lock, create, delete', async () => 
     assert.equal(createBody.data.description, 'strong');
 
     // Delete requires rev and does not delete chats by default
-    const readForDelete = await byName.read_character({ avatar: 'a1.png' });
-    const deleted = await byName.delete_character({ avatar: 'a1.png', rev: readForDelete.rev });
+    const readForDelete = await byName.read({ target: 'character', avatar: 'a1.png' });
+    const deleted = await byName.delete({ target: 'character', avatar: 'a1.png', rev: readForDelete.rev });
     assert.equal(deleted.ok, true);
     assert.equal(deleted.deleteChats, false);
     assert.equal(characters.length, 1);
     assert.equal(characters[0].avatar, 'a2.png');
 
     // Delete without rev is rejected
-    const created2 = await byName.create_character({ card: { name: 'Cid' } });
-    await assert.rejects(() => byName.delete_character({ avatar: created2.avatar }), /designer\.rev_required/);
+    const created2 = await byName.create({ target: 'character', card: { name: 'Cid' } });
+    await assert.rejects(() => byName.delete({ target: 'character', avatar: created2.avatar }), /designer\.rev_required/);
 });
 
 test('world info tools: book and entry CRUD with rev lock', async () => {
     const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildDesignerTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
     const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/src/world-info-tools.js');
 
     const worldInfoModule = createFakeWorldInfoModule();
@@ -490,41 +532,41 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
         worldInfoModule,
         promptModules: createFakePromptModules(),
     });
-    const tools = buildDesignerTools([
-        createWorldInfoResource({ st, revLock: createRevLock() }),
+    const tools = buildUnifiedTools([
+        createWorldInfoResource({ worldInfo: st.worldInfo, revLock: createRevLock() }),
     ]);
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
 
     // Create a book
-    const book = await byName.create_world_info({ book: 'Lorebook' });
+    const book = await byName.create({ target: 'world_info', book: 'Lorebook' });
     assert.equal(book.ok, true);
     assert.equal(book.created, 'book');
     assert.ok(worldInfoModule.worldInfoCache.has('Lorebook'));
 
     // Create an entry
-    const entry = await byName.create_world_info({ book: 'Lorebook', entry: { key: ['castle'], content: 'On a hill.' } });
+    const entry = await byName.create({ target: 'world_info', book: 'Lorebook', entry: { key: ['castle'], content: 'On a hill.' } });
     assert.equal(entry.ok, true);
     assert.equal(entry.created, 'entry');
     assert.equal(typeof entry.uid, 'number');
 
     // Read entry list carries a book rev
-    const list = await byName.read_world_info({ book: 'Lorebook' });
+    const list = await byName.read({ target: 'world_info', book: 'Lorebook' });
     assert.equal(list.ok, true);
     assert.equal(list.count, 1);
 
     // Case-insensitive book lookup (models mis-case names)
-    const looseList = await byName.read_world_info({ book: 'lorebook' });
+    const looseList = await byName.read({ target: 'world_info', book: 'lorebook' });
     assert.equal(looseList.ok, true);
     assert.equal(looseList.count, 1);
 
     // Read the entry carries an entry rev
-    const read = await byName.read_world_info({ book: 'Lorebook', uid: String(entry.uid) });
+    const read = await byName.read({ target: 'world_info', book: 'Lorebook', uid: String(entry.uid) });
     assert.equal(read.ok, true);
     assert.equal(read.entry.content, 'On a hill.');
 
     // Partial entries are rejected (before any successful update)
     await assert.rejects(
-        byName.update_world_info({
+        byName.update({ target: 'world_info',
             book: 'Lorebook',
             uid: String(entry.uid),
             rev: read.rev,
@@ -534,7 +576,7 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
     );
 
     // Update with the entry rev requires the COMPLETE entry
-    const updated = await byName.update_world_info({
+    const updated = await byName.update({ target: 'world_info',
         book: 'Lorebook',
         uid: String(entry.uid),
         rev: read.rev,
@@ -546,10 +588,10 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
     assert.ok(updated.updated.includes('key'));
 
     // Missing empty fields are auto-filled from the current entry
-    const freshEntryForAutoFill = await byName.read_world_info({ book: 'Lorebook', uid: String(entry.uid) });
+    const freshEntryForAutoFill = await byName.read({ target: 'world_info', book: 'Lorebook', uid: String(entry.uid) });
     const entryWithoutComment = fullEntry({ content: 'auto' });
     delete entryWithoutComment.comment;
-    const autoFilledEntry = await byName.update_world_info({
+    const autoFilledEntry = await byName.update({ target: 'world_info',
         book: 'Lorebook',
         uid: String(entry.uid),
         rev: freshEntryForAutoFill.rev,
@@ -560,7 +602,7 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
 
     // Stale rev (superseded by our own update) fails with rev_invalid
     await assert.rejects(
-        byName.update_world_info({
+        byName.update({ target: 'world_info',
             book: 'Lorebook',
             uid: String(entry.uid),
             rev: read.rev,
@@ -570,10 +612,10 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
     );
 
     // External change after a fresh read fails with rev_mismatch
-    const externalRead = await byName.read_world_info({ book: 'Lorebook', uid: String(entry.uid) });
+    const externalRead = await byName.read({ target: 'world_info', book: 'Lorebook', uid: String(entry.uid) });
     worldInfoModule.worldInfoCache.get('Lorebook').entries[entry.uid].content = 'externally edited';
     await assert.rejects(
-        byName.update_world_info({
+        byName.update({ target: 'world_info',
             book: 'Lorebook',
             uid: String(entry.uid),
             rev: externalRead.rev,
@@ -583,15 +625,15 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
     );
 
     // Delete the entry
-    const readAgain = await byName.read_world_info({ book: 'Lorebook', uid: String(entry.uid) });
-    const deletedEntry = await byName.delete_world_info({ book: 'Lorebook', uid: String(entry.uid), rev: readAgain.rev });
+    const readAgain = await byName.read({ target: 'world_info', book: 'Lorebook', uid: String(entry.uid) });
+    const deletedEntry = await byName.delete({ target: 'world_info', book: 'Lorebook', uid: String(entry.uid), rev: readAgain.rev });
     assert.equal(deletedEntry.ok, true);
     assert.equal(deletedEntry.deleted, 'entry');
     assert.equal(worldInfoModule.worldInfoCache.get('Lorebook').entries[entry.uid], undefined);
 
     // Delete the book with its book rev
-    const bookList = await byName.read_world_info({ book: 'Lorebook' });
-    const deletedBook = await byName.delete_world_info({ book: 'Lorebook', rev: bookList.rev });
+    const bookList = await byName.read({ target: 'world_info', book: 'Lorebook' });
+    const deletedBook = await byName.delete({ target: 'world_info', book: 'Lorebook', rev: bookList.rev });
     assert.equal(deletedBook.ok, true);
     assert.equal(deletedBook.deleted, 'book');
     assert.equal(worldInfoModule.worldInfoCache.has('Lorebook'), false);
@@ -599,7 +641,7 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
 
 test('prompt tools: preset CRUD with rev lock', async () => {
     const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildDesignerTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
     const { createPromptResource } = await importFresh('src/scripts/extensions/designer/src/prompt-tools.js');
 
     const promptModules = createFakePromptModules({ presets: [{ name: 'RP', content: 'old' }] });
@@ -608,69 +650,69 @@ test('prompt tools: preset CRUD with rev lock', async () => {
         worldInfoModule: createFakeWorldInfoModule(),
         promptModules,
     });
-    const tools = buildDesignerTools([
-        createPromptResource({ st, revLock: createRevLock() }),
+    const tools = buildUnifiedTools([
+        createPromptResource({ presetManager: st.presetManager, sysprompt: st.sysprompt, powerUser: st.powerUser, revLock: createRevLock() }),
     ]);
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
 
     // List
-    const list = await byName.read_prompt({});
+    const list = await byName.read({ target: 'prompt',});
     assert.equal(list.ok, true);
     assert.deepEqual(list.prompts, [{ name: 'RP', contentChars: 3 }]);
 
     // Read detail issues a rev
-    const read = await byName.read_prompt({ name: 'RP' });
+    const read = await byName.read({ target: 'prompt', name: 'RP' });
     assert.equal(read.ok, true);
     assert.equal(read.content, 'old');
 
     // Update with the rev requires the COMPLETE prompt object
-    const updated = await byName.update_prompt({ name: 'RP', rev: read.rev, prompt: { content: 'new', post_history: '' } });
+    const updated = await byName.update({ target: 'prompt', name: 'RP', rev: read.rev, prompt: { content: 'new', post_history: '' } });
     assert.equal(updated.ok, true);
     assert.equal(promptModules.systemPrompts[0].content, 'new');
 
     // Missing empty post_history is auto-filled from the current preset
-    const freshForAutoFill = await byName.read_prompt({ name: 'RP' });
-    const autoFilled = await byName.update_prompt({ name: 'RP', rev: freshForAutoFill.rev, prompt: { content: 'auto' } });
+    const freshForAutoFill = await byName.read({ target: 'prompt', name: 'RP' });
+    const autoFilled = await byName.update({ target: 'prompt', name: 'RP', rev: freshForAutoFill.rev, prompt: { content: 'auto' } });
     assert.equal(autoFilled.ok, true);
     assert.equal(promptModules.systemPrompts[0].content, 'auto');
     assert.equal(promptModules.systemPrompts[0].post_history ?? '', '');
 
     // Stale rev (superseded by our own update) fails with rev_invalid
     await assert.rejects(
-        byName.update_prompt({ name: 'RP', rev: read.rev, prompt: { content: 'x', post_history: '' } }),
+        byName.update({ target: 'prompt', name: 'RP', rev: read.rev, prompt: { content: 'x', post_history: '' } }),
         /designer\.rev_invalid/,
     );
 
     // External change after a fresh read fails with rev_mismatch
-    const externalRead = await byName.read_prompt({ name: 'RP' });
+    const externalRead = await byName.read({ target: 'prompt', name: 'RP' });
     promptModules.systemPrompts[0].content = 'externally edited';
     await assert.rejects(
-        byName.update_prompt({ name: 'RP', rev: externalRead.rev, prompt: { content: 'y', post_history: '' } }),
+        byName.update({ target: 'prompt', name: 'RP', rev: externalRead.rev, prompt: { content: 'y', post_history: '' } }),
         /designer\.rev_mismatch/,
     );
 
     // Create a new preset and reject duplicates
-    const created = await byName.create_prompt({ name: 'Noir', content: 'dark' });
+    const created = await byName.create({ target: 'prompt', name: 'Noir', content: 'dark' });
     assert.equal(created.ok, true);
     assert.equal(promptModules.systemPrompts.length, 2);
     await assert.rejects(
-        byName.create_prompt({ name: 'noir', content: 'x' }),
+        byName.create({ target: 'prompt', name: 'noir', content: 'x' }),
         /designer\.prompt_exists/,
     );
 
     // Delete with rev
-    const readNoir = await byName.read_prompt({ name: 'Noir' });
-    const deleted = await byName.delete_prompt({ name: 'Noir', rev: readNoir.rev });
+    const readNoir = await byName.read({ target: 'prompt', name: 'Noir' });
+    const deleted = await byName.delete({ target: 'prompt', name: 'Noir', rev: readNoir.rev });
     assert.equal(deleted.ok, true);
     assert.equal(promptModules.systemPrompts.length, 1);
 
     // Missing name is rejected when no system prompt is enabled
-    await assert.rejects(() => byName.delete_prompt({ rev: 'x' }), /designer\.prompt_name_required/);
+    await assert.rejects(() => byName.delete({ target: 'prompt', rev: 'x' }), /designer\.prompt_name_required/);
 });
 
 test('prompt tools: omitted name resolves to the active system prompt', async () => {
     const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildDesignerTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
     const { createPromptResource } = await importFresh('src/scripts/extensions/designer/src/prompt-tools.js');
 
     const promptModules = createFakePromptModules({ presets: [{ name: 'Active', content: 'current' }] });
@@ -680,27 +722,27 @@ test('prompt tools: omitted name resolves to the active system prompt', async ()
         worldInfoModule: createFakeWorldInfoModule(),
         promptModules,
     });
-    const tools = buildDesignerTools([
-        createPromptResource({ st, revLock: createRevLock() }),
+    const tools = buildUnifiedTools([
+        createPromptResource({ presetManager: st.presetManager, sysprompt: st.sysprompt, powerUser: st.powerUser, revLock: createRevLock() }),
     ]);
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
 
     // Read the active prompt by omitting name
-    const read = await byName.read_prompt({});
+    const read = await byName.read({ target: 'prompt',});
     assert.equal(read.ok, true);
     assert.deepEqual(read.current, { enabled: true, name: 'Active' });
 
-    const detail = await byName.read_prompt({ name: 'Active' });
+    const detail = await byName.read({ target: 'prompt', name: 'Active' });
     assert.equal(detail.content, 'current');
 
     // Update without name targets the active prompt
-    const updated = await byName.update_prompt({ rev: detail.rev, prompt: { content: 'updated', post_history: '' } });
+    const updated = await byName.update({ target: 'prompt', rev: detail.rev, prompt: { content: 'updated', post_history: '' } });
     assert.equal(updated.ok, true);
     assert.equal(promptModules.systemPrompts[0].content, 'updated');
 
     // Delete without name targets the active prompt
-    const readAgain = await byName.read_prompt({ name: 'Active' });
-    const deleted = await byName.delete_prompt({ rev: readAgain.rev });
+    const readAgain = await byName.read({ target: 'prompt', name: 'Active' });
+    const deleted = await byName.delete({ target: 'prompt', rev: readAgain.rev });
     assert.equal(deleted.ok, true);
     assert.equal(promptModules.systemPrompts.length, 0);
 });

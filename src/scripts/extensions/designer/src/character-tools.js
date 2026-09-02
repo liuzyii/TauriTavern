@@ -15,6 +15,7 @@ import {
     requireCompleteFields,
     requireString,
     verifyRevOrThrow,
+    verifyUpdateOrThrow,
 } from './common.js';
 
 /** Fields returned by read_character when no explicit field list is given. */
@@ -80,20 +81,19 @@ const CHARACTER_CARD_SCHEMA = {
 /**
  * Character card resource adapter. The avatar file itself is never modified;
  * it only serves as the (read-only) addressing id.
- * @param {{st: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>, fetchImpl?: typeof fetch}} deps
+ * @param {{script: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>, fetchImpl?: typeof fetch}} deps
  */
-export function createCharacterResource({ st, revLock, fetchImpl = globalThis.fetch }) {
+export function createCharacterResource({ script, revLock, fetchImpl = globalThis.fetch }) {
     const key = (avatar) => `character:${avatar}`;
     const fingerprintTarget = (avatar, data) => ({ avatar, data });
 
     async function resolveCharacter(avatar) {
-        const script = await st.loadScript();
         const normalized = String(avatar).trim();
         const found = script.characters.find((c) => c.avatar === normalized)
             ?? script.characters.find((c) => String(c.avatar).toLowerCase() === normalized.toLowerCase())
             ?? script.characters.find((c) => String(c.name || c.data?.name || '').toLowerCase() === normalized.toLowerCase());
         if (found) {
-            return { script, character: found };
+            return found;
         }
         const character = await script.getOneCharacter(avatar);
         if (!character) {
@@ -106,10 +106,10 @@ export function createCharacterResource({ st, revLock, fetchImpl = globalThis.fe
                 `Character "${avatar}" was not found. Available characters: ${available || 'none'}.`,
             );
         }
-        return { script, character };
+        return character;
     }
 
-    async function resolveCurrentAvatar(script) {
+    async function resolveCurrentAvatar() {
         const chid = script.this_chid;
         if (chid === undefined || !script.characters[chid]) {
             throw designerError(
@@ -136,7 +136,6 @@ export function createCharacterResource({ st, revLock, fetchImpl = globalThis.fe
     }
 
     async function read(params = {}) {
-        const script = await st.loadScript();
         const avatar = optionalString(params.avatar);
 
         if (!avatar) {
@@ -147,27 +146,27 @@ export function createCharacterResource({ st, revLock, fetchImpl = globalThis.fe
             return ok({ characters, count: characters.length });
         }
 
-        const { character } = await resolveCharacter(avatar);
+        const character = await resolveCharacter(avatar);
         const fields = normalizeFieldsParam(params.fields);
         const maxChars = normalizeMaxChars(params.maxChars, DEFAULT_READ_MAX_CHARS);
         const data = character.data ?? {};
         const canonicalAvatar = character.avatar;
-        const rev = await revLock.issue(key(canonicalAvatar), fingerprintTarget(canonicalAvatar, data));
         const view = characterView(data);
         const selected = pickFields(view, fields);
         const limited = limitObjectStrings(selected, maxChars);
+        const truncated = JSON.stringify(selected) !== JSON.stringify(limited);
+        const rev = await revLock.issue(key(canonicalAvatar), fingerprintTarget(canonicalAvatar, data), { truncated });
 
         return ok({
             avatar: canonicalAvatar,
             name: character.name || data.name || '',
             fields: limited,
             rev,
-            truncated: JSON.stringify(selected) !== JSON.stringify(limited),
+            truncated,
         });
     }
 
     async function create(params = {}) {
-        const script = await st.loadScript();
         if (!isPlainObject(params.card)) {
             throw designerError('designer.invalid_card', 'card must be an object.');
         }
@@ -200,13 +199,12 @@ export function createCharacterResource({ st, revLock, fetchImpl = globalThis.fe
     }
 
     async function update(params = {}) {
-        const script = await st.loadScript();
-        const avatar = optionalString(params.avatar) ?? await resolveCurrentAvatar(script);
-        const { character } = await resolveCharacter(avatar);
+        const avatar = optionalString(params.avatar) ?? await resolveCurrentAvatar();
+        const character = await resolveCharacter(avatar);
         const canonicalAvatar = character.avatar;
         const data = character.data ?? {};
 
-        await verifyRevOrThrow(revLock, key(canonicalAvatar), params.rev, fingerprintTarget(canonicalAvatar, data));
+        await verifyUpdateOrThrow(revLock, key(canonicalAvatar), params.rev, fingerprintTarget(canonicalAvatar, data));
 
         // Complete-object contract: the model must send every editable field
         // that currently holds content (copying unchanged values from the read
@@ -240,9 +238,8 @@ export function createCharacterResource({ st, revLock, fetchImpl = globalThis.fe
     }
 
     async function remove(params = {}) {
-        const script = await st.loadScript();
-        const avatar = optionalString(params.avatar) ?? await resolveCurrentAvatar(script);
-        const { character } = await resolveCharacter(avatar);
+        const avatar = optionalString(params.avatar) ?? await resolveCurrentAvatar();
+        const character = await resolveCharacter(avatar);
         const canonicalAvatar = character.avatar;
 
         await verifyRevOrThrow(revLock, key(canonicalAvatar), params.rev, fingerprintTarget(canonicalAvatar, character.data ?? {}));

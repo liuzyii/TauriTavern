@@ -1,14 +1,50 @@
 // @ts-check
 
-import { createStBridge } from './st-bridge.js';
+import {
+    characters,
+    this_chid,
+    getCharacters,
+    getOneCharacter,
+    deleteCharacter,
+    getRequestHeaders,
+} from '../../../script.js';
+import {
+    worldInfoCache,
+    saveWorldInfo,
+    deleteWorldInfoEntry,
+    deleteWorldInfo,
+    getFreeWorldEntryUid,
+    newWorldInfoEntryTemplate,
+} from '../../world-info.js';
+import { getPresetManager } from '../../preset-manager.js';
+import { system_prompts } from '../../sysprompt.js';
+import { power_user } from '../../power-user.js';
 import { createRevLock } from './rev-lock.js';
-import { buildDesignerTools } from './build-tools.js';
+import { buildUnifiedTools } from './build-tools.js';
 import { createCharacterResource } from './character-tools.js';
 import { createWorldInfoResource } from './world-info-tools.js';
 import { createPromptResource } from './prompt-tools.js';
 import { DESIGNER_GUIDANCE } from './guidance.js';
 
 const DESIGNER_PROMPT_KEY = 'designer';
+
+/**
+ * Shared ST module bindings handed to the resource adapters. Follows the
+ * upstream extension pattern: the extension lives in the same module graph as
+ * the app, so these are plain static imports (no runtime loading hacks).
+ */
+const script = { characters, this_chid, getCharacters, getOneCharacter, deleteCharacter, getRequestHeaders };
+const worldInfo = {
+    worldInfoCache,
+    saveWorldInfo,
+    deleteWorldInfoEntry,
+    deleteWorldInfo,
+    getFreeWorldEntryUid,
+    newWorldInfoEntryTemplate,
+};
+const presetManager = { getPresetManager };
+const sysprompt = { system_prompts };
+const powerUser = { power_user };
 
 /** @param {any} context */
 function functionCallingEnabled(context) {
@@ -17,14 +53,13 @@ function functionCallingEnabled(context) {
 
 /** @param {any} context */
 function registerTools(context) {
-    const st = createStBridge();
     const revLock = createRevLock();
     const resources = [
-        createCharacterResource({ st, revLock }),
-        createWorldInfoResource({ st, revLock }),
-        createPromptResource({ st, revLock }),
+        createCharacterResource({ script, revLock }),
+        createWorldInfoResource({ worldInfo, revLock }),
+        createPromptResource({ presetManager, sysprompt, powerUser, revLock }),
     ];
-    const tools = buildDesignerTools(resources);
+    const tools = buildUnifiedTools(resources);
     for (const tool of tools) {
         context.registerFunctionTool(tool);
     }
@@ -61,7 +96,11 @@ async function getStContext() {
     throw new Error('designer.context_unavailable: SillyTavern context is not available');
 }
 
-async function main() {
+/**
+ * Manifest "hooks.activate" entry point (upstream extension pattern, same as
+ * stable-diffusion's exported init()).
+ */
+export async function init() {
     try {
         const context = await getStContext();
         registerTools(context);
@@ -70,5 +109,3 @@ async function main() {
         console.error('[Designer] Failed to initialize:', error);
     }
 }
-
-void main();

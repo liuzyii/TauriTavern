@@ -9,6 +9,7 @@ import {
     requireCompleteFields,
     requireString,
     verifyRevOrThrow,
+    verifyUpdateOrThrow,
 } from './common.js';
 
 const DEFAULT_READ_MAX_CHARS = 200_000;
@@ -21,7 +22,7 @@ const PROMPT_MAX_CONTENT_LENGTH = 100_000;
  * behavior: the preset becomes the selected/active system prompt.
  * @param {{st: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>}} deps
  */
-export function createPromptResource({ st, revLock }) {
+export function createPromptResource({ presetManager, sysprompt, powerUser, revLock }) {
     const key = (name) => `prompt:${name}`;
 
     function fingerprintTarget(preset) {
@@ -32,16 +33,11 @@ export function createPromptResource({ st, revLock }) {
         return target;
     }
 
-    async function load() {
-        const [presetModule, syspromptModule, powerModule] = await Promise.all([
-            st.loadPresetManager(),
-            st.loadSysprompt(),
-            st.loadPowerUser(),
-        ]);
+    function load() {
         return {
-            manager: presetModule.getPresetManager('sysprompt'),
-            systemPrompts: syspromptModule.system_prompts,
-            powerUser: powerModule.power_user,
+            manager: presetManager.getPresetManager('sysprompt'),
+            systemPrompts: sysprompt.system_prompts,
+            powerUser: powerUser.power_user,
         };
     }
 
@@ -79,7 +75,7 @@ export function createPromptResource({ st, revLock }) {
     }
 
     async function read(params = {}) {
-        const { systemPrompts, powerUser } = await load();
+        const { systemPrompts, powerUser } = load();
         const requested = optionalString(params.name);
 
         if (!requested) {
@@ -103,19 +99,20 @@ export function createPromptResource({ st, revLock }) {
         }
         const maxChars = normalizeMaxChars(params.maxChars, DEFAULT_READ_MAX_CHARS);
         const content = truncatePromptContent(preset.content, maxChars);
-        const rev = await revLock.issue(key(preset.name), fingerprintTarget(preset));
+        const truncated = String(preset.content ?? '').length !== content.length;
+        const rev = await revLock.issue(key(preset.name), fingerprintTarget(preset), { truncated });
 
         return ok({
             name: preset.name,
             content,
             post_history: preset.post_history,
             rev,
-            truncated: String(preset.content ?? '').length !== content.length,
+            truncated,
         });
     }
 
     async function create(params = {}) {
-        const { manager, systemPrompts } = await load();
+        const { manager, systemPrompts } = load();
         const name = requireString(params.name, 'name');
         const content = normalizeContent(params.content);
         if (findPreset(systemPrompts, name)) {
@@ -129,13 +126,13 @@ export function createPromptResource({ st, revLock }) {
     }
 
     async function update(params = {}) {
-        const { manager, systemPrompts, powerUser } = await load();
+        const { manager, systemPrompts, powerUser } = load();
         const name = resolveTargetName(optionalString(params.name), powerUser);
         const preset = findPreset(systemPrompts, name);
         if (!preset) {
             throw designerError('designer.prompt_not_found', `System prompt "${name}" was not found.`);
         }
-        await verifyRevOrThrow(revLock, key(name), params.rev, fingerprintTarget(preset));
+        await verifyUpdateOrThrow(revLock, key(name), params.rev, fingerprintTarget(preset));
 
         // Complete-object contract: content and post_history are both required;
         // a missing empty post_history is auto-filled from the current preset,
@@ -152,7 +149,7 @@ export function createPromptResource({ st, revLock }) {
     }
 
     async function remove(params = {}) {
-        const { manager, systemPrompts, powerUser } = await load();
+        const { manager, systemPrompts, powerUser } = load();
         const name = resolveTargetName(optionalString(params.name), powerUser);
 
         const preset = findPreset(systemPrompts, name);
