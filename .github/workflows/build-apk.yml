@@ -80,19 +80,35 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Setup Android signing (CI throwaway keystore)
+      - name: Setup Android signing (release key, throwaway fallback)
         shell: bash
         run: |
           cd src-tauri/crates/tauritavern/gen/android
-          keytool -genkeypair -v -keystore "$RUNNER_TEMP/keystore.jks" \
-            -alias tauri -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass tauritavern -keypass tauritavern \
-            -dname "CN=CI, OU=CI, O=CI, L=CI, ST=CI, C=CN" 2>/dev/null
-          {
-            echo "keyAlias=tauri"
-            echo "password=tauritavern"
-            echo "storeFile=$RUNNER_TEMP/keystore.jks"
-          } > keystore.properties
+          if [ -n "${{ secrets.ANDROID_KEY_BASE64 }}" ]; then
+            echo "Using release keystore from ANDROID_KEY_* secrets"
+            echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}" > keystore.properties
+            echo "password=${{ secrets.ANDROID_KEY_PASSWORD }}" >> keystore.properties
+            base64 -d <<< "${{ secrets.ANDROID_KEY_BASE64 }}" > "$RUNNER_TEMP/keystore.jks"
+            echo "storeFile=$RUNNER_TEMP/keystore.jks" >> keystore.properties
+            # fail fast: verify the secret combination (keystore file, password,
+            # alias) before the 10-minute build. keytool errors name the problem.
+            keytool -list -keystore "$RUNNER_TEMP/keystore.jks" -storetype PKCS12 \
+              -storepass "${{ secrets.ANDROID_KEY_PASSWORD }}" \
+              -alias "${{ secrets.ANDROID_KEY_ALIAS }}" >/dev/null 2>&1 \
+              || { echo "KEYSTORE VERIFICATION FAILED: check ANDROID_KEY_BASE64/ANDROID_KEY_PASSWORD/ANDROID_KEY_ALIAS"; exit 1; }
+            echo "Release keystore verified OK"
+          else
+            echo "No ANDROID_KEY_* secrets yet - using throwaway CI keystore"
+            keytool -genkeypair -v -keystore "$RUNNER_TEMP/keystore.jks" \
+              -alias tauri -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass tauritavern -keypass tauritavern \
+              -dname "CN=CI, OU=CI, O=CI, L=CI, ST=CI, C=CN" 2>/dev/null
+            {
+              echo "keyAlias=tauri"
+              echo "password=tauritavern"
+              echo "storeFile=$RUNNER_TEMP/keystore.jks"
+            } > keystore.properties
+          fi
 
       - name: Enable HTTP access for mobile
         run: ./scripts/ci/configure-mobile-http.sh enable android
@@ -102,6 +118,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # monotonic per-workflow counter -> Android versionCode increases on
+          # every build, so each APK installs over the previous one (same
+          # signature required; see signing step).
+          TAURITAVERN_VERSION_CODE: ${{ github.run_number }}
         with:
           projectPath: src-tauri/crates/tauritavern
           tauriScript: node ../../../scripts/tauri-app.mjs

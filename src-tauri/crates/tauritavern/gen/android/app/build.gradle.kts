@@ -23,7 +23,12 @@ android {
         applicationId = "com.tauritavern.client"
         minSdk = 24
         targetSdk = 36
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
+        // versionCode: prefer TAURITAVERN_VERSION_CODE (set by CI to
+        // github.run_number so every build is installable over the previous
+        // one), then tauri.properties, then 1. Local builds keep the old
+        // behavior (no env var -> tauri.properties/default).
+        versionCode = System.getenv("TAURITAVERN_VERSION_CODE")?.toIntOrNull()
+            ?: tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
     signingConfigs {
