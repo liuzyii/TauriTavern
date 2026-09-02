@@ -27,7 +27,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DESIGNER_SRC = path.join(REPO_ROOT, 'src/scripts/extensions/designer/src');
+const DESIGNER_SRC = path.join(REPO_ROOT, 'src/scripts/extensions/designer');
 
 async function importDesigner(moduleName) {
     const url = `${pathToFileURL(path.join(DESIGNER_SRC, moduleName)).href}?t=${Date.now()}-${Math.random()}`;

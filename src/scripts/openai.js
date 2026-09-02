@@ -559,8 +559,11 @@ const default_settings = {
     top_a_openai: 0,
     repetition_penalty_openai: 1,
     stream_openai: false,
-    openai_max_context: max_4k,
-    openai_max_tokens: 300,
+    // 256k context / 8k response defaults: the complete-object update contract
+    // needs room for tool definitions + guidance + full-object echoes. Saved
+    // user settings override these; the UI slider is clamped per model source.
+    openai_max_context: 262_144,
+    openai_max_tokens: 8192,
     ...chatCompletionDefaultPrompts,
     ...promptManagerDefaultPromptOrders,
     send_if_empty: '',

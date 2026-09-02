@@ -1,15 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+test('designer index.js relative imports resolve to real app modules', async () => {
+    // The extension module is loaded by the browser at
+    // /scripts/extensions/designer/src/index.js (served root = repo src/), so
+    // every relative import resolves against that URL. A wrong number of
+    // "../" segments silently 404s at activation time — the exact failure the
+    // extension manager reports as "failed to load".
+    const entryPath = 'src/scripts/extensions/designer/index.js';
+    const source = await readFile(path.join(REPO_ROOT, entryPath), 'utf8');
+    const specifiers = [...source.matchAll(/from\s+'(\.[^']+)'/g)].map((m) => m[1]);
+    assert.ok(specifiers.length >= 8, `应至少有 8 个相对导入（实际 ${specifiers.length}）`);
+    for (const specifier of specifiers) {
+        const resolvedPath = new URL(specifier, 'http://local/scripts/extensions/designer/index.js').pathname;
+        const repoFile = path.join(REPO_ROOT, 'src', resolvedPath.replace(/^\//, '').replace(/\//g, path.sep));
+        assert.ok(existsSync(repoFile), `相对导入解析不到文件：${specifier} -> ${resolvedPath}`);
+    }
+});
+
 test('persona tools: read and update with rev lock', async () => {
-    const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
-    const { createPersonaResource } = await importFresh('src/scripts/extensions/designer/src/persona-tools.js');
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
+    const { createPersonaResource } = await importFresh('src/scripts/extensions/designer/persona-tools.js');
 
     const promptModules = createFakePromptModules();
     const powerUser = promptModules.powerUser.power_user;
@@ -96,7 +114,7 @@ test('persona tools: read and update with rev lock', async () => {
 });
 
 test('common: buildDesignerContext formats the dynamic environment list', async () => {
-    const common = await importFresh('src/scripts/extensions/designer/src/common.js');
+    const common = await importFresh('src/scripts/extensions/designer/common.js');
 
     // Full state
     const text = common.buildDesignerContext({
@@ -295,7 +313,7 @@ function fakeSt({ scriptModule, worldInfoModule, promptModules, personas = { use
 }
 
 test('rev-lock: issue, verify, commit and forget lifecycle', async () => {
-    const { createRevLock, canonicalJson, fingerprint } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
+    const { createRevLock, canonicalJson, fingerprint } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
     const lock = createRevLock();
 
     const value = { b: 1, a: [3, 2] };
@@ -352,7 +370,7 @@ test('rev-lock: issue, verify, commit and forget lifecycle', async () => {
 });
 
 test('common: character update whitelist and payload builders', async () => {
-    const common = await importFresh('src/scripts/extensions/designer/src/common.js');
+    const common = await importFresh('src/scripts/extensions/designer/common.js');
 
     const normalized = common.normalizeCharacterUpdates({
         description: 'brave',
@@ -384,7 +402,7 @@ test('common: character update whitelist and payload builders', async () => {
 });
 
 test('common: world entry whitelist and truncation', async () => {
-    const common = await importFresh('src/scripts/extensions/designer/src/common.js');
+    const common = await importFresh('src/scripts/extensions/designer/common.js');
 
     const normalized = common.normalizeWorldEntryUpdates({
         key: ['castle'],
@@ -407,12 +425,12 @@ test('common: world entry whitelist and truncation', async () => {
 });
 
 test('designer tools: 4 unified lowercase CRUD tools with target dispatch', async () => {
-    const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
-    const { createCharacterResource } = await importFresh('src/scripts/extensions/designer/src/character-tools.js');
-    const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/src/world-info-tools.js');
-    const { createPromptResource } = await importFresh('src/scripts/extensions/designer/src/prompt-tools.js');
-    const { createPersonaResource } = await importFresh('src/scripts/extensions/designer/src/persona-tools.js');
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
+    const { createCharacterResource } = await importFresh('src/scripts/extensions/designer/character-tools.js');
+    const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/world-info-tools.js');
+    const { createPromptResource } = await importFresh('src/scripts/extensions/designer/prompt-tools.js');
+    const { createPersonaResource } = await importFresh('src/scripts/extensions/designer/persona-tools.js');
 
     const st = fakeSt({
         scriptModule: createFakeScriptModule(),
@@ -457,7 +475,7 @@ test('designer tools: 4 unified lowercase CRUD tools with target dispatch', asyn
 });
 
 test('designer tools: adding a resource adapter extends the target enum uniformly', async () => {
-    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
 
     const personaResource = {
         name: 'persona',
@@ -518,9 +536,9 @@ function fullEntry(overrides = {}) {
 }
 
 test('character tools: read, update with rev lock, create, delete', async () => {
-    const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
-    const { createCharacterResource } = await importFresh('src/scripts/extensions/designer/src/character-tools.js');
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
+    const { createCharacterResource } = await importFresh('src/scripts/extensions/designer/character-tools.js');
 
     const characters = [
         { avatar: 'a1.png', name: 'Ada', data: { name: 'Ada', description: 'hello', personality: 'dry humor', tags: ['librarian'], talkativeness: 0.5, extensions: {} } },
@@ -671,9 +689,9 @@ test('character tools: read, update with rev lock, create, delete', async () => 
 });
 
 test('world info tools: book and entry CRUD with rev lock', async () => {
-    const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
-    const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/src/world-info-tools.js');
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
+    const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/world-info-tools.js');
 
     const worldInfoModule = createFakeWorldInfoModule();
     const st = fakeSt({
@@ -789,9 +807,9 @@ test('world info tools: book and entry CRUD with rev lock', async () => {
 });
 
 test('prompt tools: preset CRUD with rev lock', async () => {
-    const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
-    const { createPromptResource } = await importFresh('src/scripts/extensions/designer/src/prompt-tools.js');
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
+    const { createPromptResource } = await importFresh('src/scripts/extensions/designer/prompt-tools.js');
 
     const promptModules = createFakePromptModules({ presets: [{ name: 'RP', content: 'old' }] });
     const st = fakeSt({
@@ -860,9 +878,9 @@ test('prompt tools: preset CRUD with rev lock', async () => {
 });
 
 test('prompt tools: omitted name resolves to the active system prompt', async () => {
-    const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
-    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
-    const { createPromptResource } = await importFresh('src/scripts/extensions/designer/src/prompt-tools.js');
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
+    const { createPromptResource } = await importFresh('src/scripts/extensions/designer/prompt-tools.js');
 
     const promptModules = createFakePromptModules({ presets: [{ name: 'Active', content: 'current' }] });
     promptModules.powerUser.power_user.sysprompt = { enabled: true, name: 'Active', content: 'current' };

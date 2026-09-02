@@ -102,18 +102,17 @@ prompts: "RP", "Design Session" (active)
 
 ```text
 src/scripts/extensions/designer/
-├── manifest.json          # 扩展清单（js: src/index.js，hooks.activate=init，上游加载模式）
+├── manifest.json          # 扩展清单（js: index.js，hooks.activate=init，上游加载模式）
 ├── README.md
-└── src/
-    ├── index.js           # 组合资源适配器 + 注册工具 + 注入短系统提示（方案 B）
-    ├── guidance.js        # 注入的系统提示文案（单一事实源，e2e 测试同源使用）
-    ├── build-tools.js     # 统一 CRUD 构建器（资源适配器 -> 4 个 target 派发工具）
-    ├── rev-lock.js        # canonicalJson / sha256 截断 / rev 登记与校验
-    ├── common.js          # 白名单、校验、错误码、完整对象契约、ToolManager 定义组装
-    ├── character-tools.js # 资源适配器：角色卡
-    ├── persona-tools.js   # 资源适配器：用户人设
-    ├── world-info-tools.js# 资源适配器：世界书
-    └── prompt-tools.js    # 资源适配器：系统提示词
+├── index.js           # 组合资源适配器 + 注册工具 + 注入短系统提示（方案 B）
+├── guidance.js        # 注入的系统提示文案（单一事实源，e2e 测试同源使用）
+├── build-tools.js     # 统一 CRUD 构建器（资源适配器 -> 4 个 target 派发工具）
+├── rev-lock.js        # canonicalJson / sha256 截断 / rev 登记与校验
+├── common.js          # 白名单、校验、错误码、完整对象契约、ToolManager 定义组装
+├── character-tools.js # 资源适配器：角色卡
+├── persona-tools.js   # 资源适配器：用户人设
+├── world-info-tools.js# 资源适配器：世界书
+└── prompt-tools.js    # 资源适配器：系统提示词
 ```
 
 > **加载与暴露机制完全遵循上游 SillyTavern 模式**（与 stable-diffusion 一致）：
@@ -125,7 +124,7 @@ src/scripts/extensions/designer/
 
 ## 构建与测试
 
-- 构建：designer **不需要 rspack 打包**（manifest `js` 指向源码 `src/index.js`，按上游模式以源码模块加载）；`pnpm run web:build` 不涉及 designer。
+- 构建：designer **不需要 rspack 打包**（manifest `js` 指向源码 `index.js`，按上游模式以源码模块加载）；`pnpm run web:build` 不涉及 designer。
 - 测试：`node --test tests/designer-contract.test.mjs`；完整契约套件：`pnpm run test:contracts`。
 - 守护：`pnpm run check:frontend`。
 
