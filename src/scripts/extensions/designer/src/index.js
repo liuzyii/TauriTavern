@@ -7,7 +7,10 @@ import {
     getOneCharacter,
     deleteCharacter,
     getRequestHeaders,
+    saveSettingsDebounced,
 } from '../../../script.js';
+import { eventSource, event_types } from '../../events.js';
+import { user_avatar } from '../../personas.js';
 import {
     worldInfoCache,
     saveWorldInfo,
@@ -21,12 +24,15 @@ import { system_prompts } from '../../sysprompt.js';
 import { power_user } from '../../power-user.js';
 import { createRevLock } from './rev-lock.js';
 import { buildUnifiedTools } from './build-tools.js';
+import { buildDesignerContext } from './common.js';
 import { createCharacterResource } from './character-tools.js';
 import { createWorldInfoResource } from './world-info-tools.js';
 import { createPromptResource } from './prompt-tools.js';
+import { createPersonaResource } from './persona-tools.js';
 import { DESIGNER_GUIDANCE } from './guidance.js';
 
 const DESIGNER_PROMPT_KEY = 'designer';
+const DESIGNER_CONTEXT_KEY = 'designer-context';
 
 /**
  * Shared ST module bindings handed to the resource adapters. Follows the
@@ -45,6 +51,7 @@ const worldInfo = {
 const presetManager = { getPresetManager };
 const sysprompt = { system_prompts };
 const powerUser = { power_user };
+const personas = { user_avatar };
 
 /** @param {any} context */
 function functionCallingEnabled(context) {
@@ -58,6 +65,13 @@ function registerTools(context) {
         createCharacterResource({ script, revLock }),
         createWorldInfoResource({ worldInfo, revLock }),
         createPromptResource({ presetManager, sysprompt, powerUser, revLock }),
+        createPersonaResource({
+            personas,
+            powerUser,
+            saveSettings: saveSettingsDebounced,
+            emit: (type, payload) => eventSource.emit(event_types[type], payload),
+            revLock,
+        }),
     ];
     const tools = buildUnifiedTools(resources);
     for (const tool of tools) {
@@ -85,6 +99,47 @@ function syncGuidance(context) {
     );
 }
 
+/** Snapshot of the current design objects for the dynamic context prompt. */
+function currentDesignerContextState() {
+    const books = [];
+    for (const name of worldInfoCache.keys()) {
+        const data = worldInfoCache.get(name);
+        books.push({ name, entries: data?.entries ? Object.keys(data.entries).length : 0 });
+    }
+    const personaId = personas.user_avatar;
+    return {
+        characters: characters.map((c) => ({ avatar: c.avatar, name: c.name || c.data?.name || '' })),
+        personaId,
+        personaName: personaId ? power_user.personas?.[personaId] : undefined,
+        books,
+        prompts: system_prompts.map((p) => p.name),
+        activePrompt: power_user.sysprompt?.enabled ? power_user.sysprompt.name : undefined,
+    };
+}
+
+/**
+ * Refreshes the dynamic context prompt with the current object list. Runs
+ * before every generation (manifest "generate_interceptor", same mechanism as
+ * stable-diffusion), so the list stays fresh even across tool-loop rounds —
+ * objects created mid-conversation appear on the very next request. The
+ * function-calling filter keeps it invisible when tools are not injected.
+ */
+export async function designerGenerateInterceptor() {
+    const context = window.SillyTavern?.getContext?.();
+    if (!context) {
+        return;
+    }
+    context.setExtensionPrompt(
+        DESIGNER_CONTEXT_KEY,
+        buildDesignerContext(currentDesignerContextState()),
+        0,
+        0,
+        false,
+        undefined,
+        () => functionCallingEnabled(context),
+    );
+}
+
 /** Resolves the SillyTavern extension context once the app is ready. */
 async function getStContext() {
     for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -105,6 +160,7 @@ export async function init() {
         const context = await getStContext();
         registerTools(context);
         syncGuidance(context);
+        await designerGenerateInterceptor();
     } catch (error) {
         console.error('[Designer] Failed to initialize:', error);
     }

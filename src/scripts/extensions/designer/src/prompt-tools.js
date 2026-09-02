@@ -20,18 +20,15 @@ const PROMPT_MAX_CONTENT_LENGTH = 100_000;
  * in power_user.sysprompt; the preset library is managed by the sysprompt
  * preset manager (system_prompts array). Saving a preset follows the ST UI
  * behavior: the preset becomes the selected/active system prompt.
- * @param {{st: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>}} deps
+ * @param {{presetManager: any, sysprompt: any, powerUser: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>}} deps
  */
 export function createPromptResource({ presetManager, sysprompt, powerUser, revLock }) {
     const key = (name) => `prompt:${name}`;
 
-    function fingerprintTarget(preset) {
-        const target = { name: preset.name, content: preset.content };
-        if (preset.post_history !== undefined) {
-            target.post_history = preset.post_history;
-        }
-        return target;
-    }
+    // Whole-preset fingerprint: the rev lock granularity is the object (not
+    // the editable surface), matching character cards and world info — any
+    // external change to the preset invalidates the rev, editable or not.
+    const fingerprintTarget = (preset) => preset;
 
     function load() {
         return {
@@ -172,7 +169,6 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
         verbs: {
             read: {
                 action: read,
-                description: 'List system prompt presets (with the currently active one), or read one preset by name. Use this when the user asks about designing or changing system prompts. Omit name to list presets. Pass name to read its content; the result includes a rev that update_prompt/delete_prompt require.',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -183,7 +179,6 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
             },
             create: {
                 action: create,
-                description: 'Create a new system prompt preset with the given content. After saving, the preset becomes the selected system prompt (same as saving it in the UI).',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -195,12 +190,11 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
             },
             update: {
                 action: update,
-                description: 'Replace the content of an existing system prompt preset with the COMPLETE prompt object { content, post_history }: copy both fields from read_prompt and change only what you need; partial objects are rejected with designer.incomplete_update. Requires a rev from read_prompt. Omit name to update the currently enabled system prompt. After saving, the preset becomes the selected system prompt (same as saving it in the UI).',
                 parameters: {
                     type: 'object',
                     properties: {
                         name: { type: 'string', description: 'Preset name to update. Omit to update the currently enabled system prompt.' },
-                        rev: { type: 'string', description: 'Revision obtained from read_prompt.' },
+                        rev: { type: 'string', description: 'Revision obtained from read.' },
                         prompt: {
                             type: 'object',
                             description: 'Complete prompt data. Both fields are required; copy unchanged values from the read result.',
@@ -216,12 +210,11 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
             },
             delete: {
                 action: remove,
-                description: 'Delete a system prompt preset. Requires a rev from read_prompt. Omit name to delete the currently enabled system prompt. Deleting the currently selected preset follows the ST UI behavior (another preset is selected). This is destructive and irreversible.',
                 parameters: {
                     type: 'object',
                     properties: {
                         name: { type: 'string', description: 'Preset name to delete. Omit to delete the currently enabled system prompt.' },
-                        rev: { type: 'string', description: 'Revision obtained from read_prompt.' },
+                        rev: { type: 'string', description: 'Revision obtained from read.' },
                     },
                     required: ['rev'],
                 },

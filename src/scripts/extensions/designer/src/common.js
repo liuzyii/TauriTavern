@@ -493,6 +493,41 @@ export function summarizeToolCall(name, params) {
 }
 
 /**
+ * Builds the dynamic "Designer context" prompt: a compact snapshot of the
+ * current design objects, refreshed by the generate interceptor before every
+ * request. Ids come first so the model can call read with them directly;
+ * names are quoted (they may contain spaces); the active prompt is marked.
+ * @param {{
+ *   characters: Array<{avatar: string, name: string}>,
+ *   personaId?: string,
+ *   personaName?: string,
+ *   books: Array<{name: string, entries: number}>,
+ *   prompts: string[],
+ *   activePrompt?: string,
+ *   maxItems?: number,
+ * }} state
+ */
+export function buildDesignerContext({ characters, personaId, personaName, books, prompts, activePrompt, maxItems = 20 }) {
+    const lines = [];
+    const charLines = characters.slice(0, maxItems).map((c) => `${c.avatar} "${c.name}"`);
+    if (charLines.length) {
+        lines.push(`characters: ${charLines.join(', ')}`);
+    }
+    if (personaId && personaName) {
+        lines.push(`persona: ${personaId} "${personaName}"`);
+    }
+    const bookLines = books.slice(0, maxItems).map((b) => `"${b.name}" (${b.entries} ${b.entries === 1 ? 'entry' : 'entries'})`);
+    if (bookLines.length) {
+        lines.push(`world info: ${bookLines.join(', ')}`);
+    }
+    const promptLines = prompts.slice(0, maxItems).map((p) => (p === activePrompt ? `"${p}" (active)` : `"${p}"`));
+    if (promptLines.length) {
+        lines.push(`prompts: ${promptLines.join(', ')}`);
+    }
+    return ['Designer context (current objects; call read for details):', ...lines].join('\n');
+}
+
+/**
  * Assembles a ToolManager registration from a raw tool definition.
  * `shouldRegister` stays true: the outer function-calling gate in ST only
  * injects tools when function calling is enabled and supported.

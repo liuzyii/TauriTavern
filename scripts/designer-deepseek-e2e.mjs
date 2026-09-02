@@ -190,7 +190,13 @@ function createFakeBackend() {
     };
     const presetManager = { getPresetManager: () => manager };
     const sysprompt = { system_prompts: systemPrompts };
-    const powerUser = { power_user: { sysprompt: { enabled: false, name: '', content: '' } } };
+    const powerUser = {
+        power_user: {
+            sysprompt: { enabled: false, name: '', content: '' },
+            personas: {},
+            persona_descriptions: {},
+        },
+    };
 
     const st = {
         script: scriptModule,
@@ -198,6 +204,7 @@ function createFakeBackend() {
         presetManager,
         sysprompt,
         powerUser,
+        personas: { user_avatar: '' },
     };
 
     return { st, backend: { characters, worldInfoCache, systemPrompts, fetchImpl } };
@@ -208,18 +215,26 @@ function createFakeBackend() {
 // ---------------------------------------------------------------------------
 
 async function buildTools({ st, fetchImpl }) {
-    const [{ createRevLock }, { buildUnifiedTools }, { createCharacterResource }, { createWorldInfoResource }, { createPromptResource }] = await Promise.all([
+    const [{ createRevLock }, { buildUnifiedTools }, { createCharacterResource }, { createWorldInfoResource }, { createPromptResource }, { createPersonaResource }] = await Promise.all([
         importDesigner('rev-lock.js'),
         importDesigner('build-tools.js'),
         importDesigner('character-tools.js'),
         importDesigner('world-info-tools.js'),
         importDesigner('prompt-tools.js'),
+        importDesigner('persona-tools.js'),
     ]);
     const revLock = createRevLock();
     const tools = buildUnifiedTools([
         createCharacterResource({ script: st.script, revLock, fetchImpl }),
         createWorldInfoResource({ worldInfo: st.worldInfo, revLock }),
         createPromptResource({ presetManager: st.presetManager, sysprompt: st.sysprompt, powerUser: st.powerUser, revLock }),
+        createPersonaResource({
+            personas: st.personas,
+            powerUser: st.powerUser,
+            saveSettings: () => {},
+            emit: () => {},
+            revLock,
+        }),
     ]);
     const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
     const openaiTools = tools.map((t) => ({
@@ -448,14 +463,20 @@ async function main() {
     // 感知场景：模型能否自发感知并正确使用工具（用户消息均为自然语言，不提示工具）
     // ==========================================================================
 
-    // P1：真实引导文案 + 角色卡已在上下文中（同真实 Prompt 组装）+ 自然语言修改意图
+    // P1：真实提示组装（环境清单由真实 builder 生成 + 角色卡在上下文中）+ 自然语言修改意图
     await scenario('感知P1：真实引导文案 + 自然语言（改角色卡）', async () => {
         const adaCardForP1 = backend.characters.find((c) => c.avatar === 'ada.png').data;
         const adaBefore = String(adaCardForP1.description || '');
         const beforeP1 = snapshotCalls();
+        const { buildDesignerContext } = await importDesigner('common.js');
+        const envContext = buildDesignerContext({
+            characters: [{ avatar: 'ada.png', name: 'Ada' }],
+            books: [{ name: 'Tavern', entries: 1 }],
+            prompts: ['RP'],
+        });
         await runScenario({
             title: '感知P1：真实引导文案 + 自然语言（改角色卡）',
-            system: `You are a character design assistant. The active character card is: ${JSON.stringify(adaCardForP1)}. ` + DESIGNER_GUIDANCE,
+            system: `You are a character design assistant. The active character card is: ${JSON.stringify(adaCardForP1)}.\n\n${envContext}\n\n` + DESIGNER_GUIDANCE,
             user: '帮我把 Ada 的角色卡改一下：她其实暗中收藏塔罗牌，把这一点写进她的描述里。',
             byName,
             openaiTools,
@@ -485,7 +506,7 @@ async function main() {
         });
         const calls = scenarioToolCalls(beforeP2);
         perception.p2 = calls;
-        assert(calls.includes('create_world_info'), 'P2：无引导时模型仍凭工具描述自发调用 create_world_info', calls.join(', ') || '（未调用任何工具）');
+        assert(calls.includes('create'), 'P2：无引导时模型仍凭工具描述自发调用 create', calls.join(', ') || '（未调用任何工具）');
         assert(Boolean(backend.worldInfoCache.get('Moon & Tides')), 'P2：世界书 "Moon & Tides" 已创建');
     });
 
@@ -547,7 +568,7 @@ async function main() {
         const calls = scenarioToolCalls(beforeP4);
         perception.p4 = calls;
         const updateIndex = calls.indexOf('update');
-        assert(updateIndex >= 0, 'P4：模型自发调用 update_world_info', calls.join(', '));
+        assert(updateIndex >= 0, 'P4：模型自发调用 update（target=world_info）', calls.join(', '));
         assert(calls.slice(0, updateIndex).some((name) => name === 'read'), 'P4：修改前先读世界书', calls.join(', '));
         const fairNow = String(Object.values(backend.worldInfoCache.get("Mira's World").entries)
             .find((e) => Array.isArray(e.key) && e.key.includes('tarot_fair')).content || '');

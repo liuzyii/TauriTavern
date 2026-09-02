@@ -6,6 +6,141 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
+test('persona tools: read and update with rev lock', async () => {
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/src/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/src/build-tools.js');
+    const { createPersonaResource } = await importFresh('src/scripts/extensions/designer/src/persona-tools.js');
+
+    const promptModules = createFakePromptModules();
+    const powerUser = promptModules.powerUser.power_user;
+    powerUser.personas = { p1: 'Ada', p2: 'Mira' };
+    powerUser.persona_descriptions = {
+        p1: { description: 'A quiet archivist.' },
+        p2: { description: '' },
+    };
+    const st = fakeSt({
+        scriptModule: createFakeScriptModule(),
+        worldInfoModule: createFakeWorldInfoModule(),
+        promptModules,
+        personas: { user_avatar: 'p1' },
+    });
+
+    const saved = [];
+    const emitted = [];
+    const tools = buildUnifiedTools([
+        createPersonaResource({
+            personas: st.personas,
+            powerUser: st.powerUser,
+            saveSettings: () => saved.push('save'),
+            emit: (type, payload) => emitted.push({ type, payload }),
+            revLock: createRevLock(),
+        }),
+    ]);
+    const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
+
+    // List with the active persona
+    const list = await byName.read({ target: 'persona' });
+    assert.equal(list.ok, true);
+    assert.equal(list.count, 2);
+    assert.equal(list.current, 'p1');
+
+    // Detail issues a rev
+    const read = await byName.read({ target: 'persona', id: 'p1' });
+    assert.equal(read.name, 'Ada');
+    assert.equal(read.description, 'A quiet archivist.');
+    assert.ok(read.rev.length > 0);
+
+    // Complete-object update (name change emits the rename event)
+    const updated = await byName.update({
+        target: 'persona',
+        id: 'p1',
+        rev: read.rev,
+        persona: { name: 'Ada the Archivist', description: 'A quiet archivist who guards the stacks.' },
+    });
+    assert.equal(updated.ok, true);
+    assert.equal(powerUser.personas.p1, 'Ada the Archivist');
+    assert.equal(powerUser.persona_descriptions.p1.description, 'A quiet archivist who guards the stacks.');
+    assert.equal(powerUser.persona_description, 'A quiet archivist who guards the stacks.', '活动人设同步 legacy 字段');
+    assert.equal(saved.length, 1, '更新后保存设置');
+    assert.deepEqual(emitted[0], {
+        type: 'PERSONA_RENAMED',
+        payload: { avatarId: 'p1', oldName: 'Ada', newName: 'Ada the Archivist' },
+    });
+
+    // Stale rev fails
+    await assert.rejects(
+        byName.update({ target: 'persona', id: 'p1', rev: read.rev, persona: { name: 'X', description: '' } }),
+        /designer\.rev_invalid/,
+    );
+
+    // Missing non-empty description is rejected (complete-object contract)
+    const read2 = await byName.read({ target: 'persona', id: 'p1' });
+    await assert.rejects(
+        byName.update({ target: 'persona', id: 'p1', rev: read2.rev, persona: { name: 'Ada' } }),
+        /designer\.incomplete_update/,
+    );
+
+    // Unknown persona
+    await assert.rejects(byName.read({ target: 'persona', id: 'nobody' }), /designer\.persona_not_found/);
+
+    // Omitted id targets the active persona
+    const read3 = await byName.read({ target: 'persona', id: 'p1' });
+    const viaActive = await byName.update({
+        target: 'persona',
+        rev: read3.rev,
+        persona: { name: 'Ada the Archivist', description: 'Updated via the active persona.' },
+    });
+    assert.equal(viaActive.ok, true);
+    assert.equal(viaActive.id, 'p1');
+    assert.equal(powerUser.persona_descriptions.p1.description, 'Updated via the active persona.');
+});
+
+test('common: buildDesignerContext formats the dynamic environment list', async () => {
+    const common = await importFresh('src/scripts/extensions/designer/src/common.js');
+
+    // Full state
+    const text = common.buildDesignerContext({
+        characters: [
+            { avatar: 'ada.png', name: 'Ada' },
+            { avatar: 'created-1.png', name: 'Mira the Wanderer' },
+        ],
+        personaId: 'p1',
+        personaName: 'Ada the Archivist',
+        books: [
+            { name: "Mira's World", entries: 2 },
+            { name: 'Tavern', entries: 1 },
+        ],
+        prompts: ['RP', 'Design Session'],
+        activePrompt: 'Design Session',
+    });
+    const expected = [
+        'Designer context (current objects; call read for details):',
+        'characters: ada.png "Ada", created-1.png "Mira the Wanderer"',
+        'persona: p1 "Ada the Archivist"',
+        'world info: "Mira\'s World" (2 entries), "Tavern" (1 entry)',
+        'prompts: "RP", "Design Session" (active)',
+    ].join('\n');
+    assert.equal(text, expected);
+
+    // Empty state keeps only the header
+    const empty = common.buildDesignerContext({ characters: [], books: [], prompts: [] });
+    assert.equal(empty, 'Designer context (current objects; call read for details):');
+
+    // No persona -> no persona line; maxItems caps the list
+    const capped = common.buildDesignerContext({
+        characters: [
+            { avatar: 'a.png', name: 'A' },
+            { avatar: 'b.png', name: 'B' },
+            { avatar: 'c.png', name: 'C' },
+        ],
+        books: [],
+        prompts: [],
+        maxItems: 2,
+    });
+    assert.ok(capped.includes('a.png "A", b.png "B"'));
+    assert.ok(!capped.includes('c.png'));
+});
+
 test('designer extension is registered in the system extension allowlist', async () => {
     // The Tauri backend only reports bundled extensions listed in
     // ENABLED_SYSTEM_EXTENSIONS; a missing entry silently prevents the whole
@@ -148,13 +283,14 @@ function createFakePromptModules({ presets = [] } = {}) {
     };
 }
 
-function fakeSt({ scriptModule, worldInfoModule, promptModules }) {
+function fakeSt({ scriptModule, worldInfoModule, promptModules, personas = { user_avatar: '' } }) {
     return {
         script: scriptModule,
         worldInfo: worldInfoModule,
         presetManager: promptModules.presetManager,
         sysprompt: promptModules.sysprompt,
         powerUser: promptModules.powerUser,
+        personas,
     };
 }
 
@@ -276,11 +412,13 @@ test('designer tools: 4 unified lowercase CRUD tools with target dispatch', asyn
     const { createCharacterResource } = await importFresh('src/scripts/extensions/designer/src/character-tools.js');
     const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/src/world-info-tools.js');
     const { createPromptResource } = await importFresh('src/scripts/extensions/designer/src/prompt-tools.js');
+    const { createPersonaResource } = await importFresh('src/scripts/extensions/designer/src/persona-tools.js');
 
     const st = fakeSt({
         scriptModule: createFakeScriptModule(),
         worldInfoModule: createFakeWorldInfoModule(),
         promptModules: createFakePromptModules(),
+        personas: { user_avatar: '' },
     });
     const revLock = createRevLock();
 
@@ -288,23 +426,34 @@ test('designer tools: 4 unified lowercase CRUD tools with target dispatch', asyn
         createCharacterResource({ script: st.script, revLock }),
         createWorldInfoResource({ worldInfo: st.worldInfo, revLock }),
         createPromptResource({ presetManager: st.presetManager, sysprompt: st.sysprompt, powerUser: st.powerUser, revLock }),
+        createPersonaResource({
+            personas: st.personas,
+            powerUser: st.powerUser,
+            saveSettings: () => {},
+            emit: () => {},
+            revLock,
+        }),
     ]);
 
     assert.deepEqual(tools.map((t) => t.name), ['read', 'create', 'update', 'delete']);
+    const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+    const fullTargets = ['character', 'world_info', 'prompt', 'persona'];
+    const crudTargets = ['character', 'world_info', 'prompt'];
     for (const tool of tools) {
         assert.equal(tool.name, tool.name.toLowerCase());
         assert.equal(typeof tool.description, 'string');
         assert.equal(tool.description.length > 100, true);
         assert.equal(typeof tool.parameters, 'object');
         assert.deepEqual(tool.parameters.required, ['target']);
-        assert.deepEqual(tool.parameters.properties.target.enum, ['character', 'world_info', 'prompt']);
+        const enumTargets = tool.parameters.properties.target.enum;
+        assert.deepEqual(enumTargets, tool.name === 'read' || tool.name === 'update' ? fullTargets : crudTargets);
         assert.equal(typeof tool.action, 'function');
         assert.equal(typeof tool.formatMessage, 'function');
         assert.equal(tool.shouldRegister(), true);
     }
 
     // Dispatch rejects unknown targets with a recoverable error
-    await assert.rejects(tools[0].action({ target: 'nobody' }), /designer\.unknown_target/);
+    await assert.rejects(byName.read.action({ target: 'nobody' }), /designer\.unknown_target/);
 });
 
 test('designer tools: adding a resource adapter extends the target enum uniformly', async () => {

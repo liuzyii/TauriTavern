@@ -7,23 +7,28 @@ const CRUD_VERBS = ['read', 'create', 'update', 'delete'];
 /** @type {Record<string, (targets: string[]) => string>} */
 const VERB_DESCRIPTIONS = {
     read: (targets) => `Read design objects. Choose target from [${targets.join(' | ')}]: ` +
-        '"character" reads a character card (omit avatar to list characters; pass avatar plus optional fields[] and maxChars to read a card and get its rev); ' +
+        '"character" reads a character card (omit avatar to list characters; pass avatar plus optional maxChars to read a card and get its rev); ' +
         '"world_info" reads a lorebook or entry (omit book to list books; pass book without uid to list entries and get a book rev; pass book and uid to read an entry and get its rev); ' +
-        '"prompt" reads a system prompt preset (omit name to list presets; pass name to read content and get its rev). ' +
-        'Always read an object before updating or deleting it, and use the returned rev.',
+        '"prompt" reads a system prompt preset (omit name to list presets; pass name to read content and get its rev); ' +
+        '"persona" reads the user persona (omit id to list personas with the active one; pass id to read name and description and get its rev). ' +
+        'Always read an object before updating or deleting it, and use the returned rev. ' +
+        'Examples: read({target:"character"}) lists characters; read({target:"character", avatar:"ada.png"}) reads a card; read({target:"world_info", book:"Mira\'s World", uid:"0"}) reads an entry.',
     create: (targets) => `Create a design object. Choose target from [${targets.join(' | ')}]: ` +
         '"character" creates a character card (card.name required; other card fields optional); ' +
         '"world_info" creates a lorebook (book) and optionally an entry (entry.key required, at least one keyword); ' +
         '"prompt" creates a system prompt preset (name and content required). ' +
-        'Changes apply immediately and are shown in the chat.',
+        'Changes apply immediately and are shown in the chat. ' +
+        'Example: create({target:"character", card:{name:"Mira", description:"A wandering fortune-teller."}}).',
     update: (targets) => `Replace the editable fields of an existing design object with the COMPLETE object. Choose target from [${targets.join(' | ')}]; the rev from a recent read is required. ` +
         'Copy every field from the read result and change only what you need; missing non-empty fields are rejected (designer.incomplete_update), missing empty fields and explicit nulls keep their current values. ' +
-        '"character": card (all editable fields). "world_info": entry (book and uid). "prompt": prompt {content, post_history}; omit name to target the current system prompt.',
+        '"character": card (all editable fields). "world_info": entry (book and uid). "prompt": prompt {content, post_history}; omit name to target the current system prompt. "persona": persona {name, description}; omit id to target the active persona. ' +
+        'Example: update({target:"world_info", book:"Mira\'s World", uid:"0", rev:"f9773d", entry:{...every field from the read result...}}).',
     delete: (targets) => `Delete a design object. Choose target from [${targets.join(' | ')}]; the rev from a recent read is required. ` +
         '"character" deletes a character card (avatar optional, defaults to the current chat; deleteChats defaults to false). ' +
         '"world_info" deletes an entry (book and uid) or the whole lorebook (book, omit uid). ' +
         '"prompt" deletes a system prompt preset (name optional, defaults to the current one). ' +
-        'Destructive and irreversible — use only when the user explicitly asks to delete.',
+        'Destructive and irreversible — use only when the user explicitly asks to delete. ' +
+        'Example: delete({target:"prompt", name:"Old Preset", rev:"8f9220"}).',
 };
 
 /**
@@ -37,7 +42,7 @@ const VERB_DESCRIPTIONS = {
  * Resource adapters keep their per-target validation (rev lock, complete
  * object contract, type whitelists) — the schema union is only the transport.
  *
- * @param {Array<{name: string, verbs: Partial<Record<'read'|'create'|'update'|'delete', {action: (params: any) => Promise<any>, description: string, parameters: object}>>}>} resources
+ * @param {Array<{name: string, verbs: Partial<Record<'read'|'create'|'update'|'delete', {action: (params: any) => Promise<any>, parameters: object}>>}>} resources
  */
 export function buildUnifiedTools(resources) {
     /** @type {Record<string, Array<{target: string, def: any}>>} */

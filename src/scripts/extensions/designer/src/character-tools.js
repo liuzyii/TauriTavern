@@ -18,25 +18,6 @@ import {
     verifyUpdateOrThrow,
 } from './common.js';
 
-/** Fields returned by read_character when no explicit field list is given. */
-const DEFAULT_READ_FIELDS = [
-    'name',
-    'description',
-    'personality',
-    'scenario',
-    'first_mes',
-    'mes_example',
-    'system_prompt',
-    'post_history_instructions',
-    'creator_notes',
-    'creator',
-    'character_version',
-    'tags',
-    'talkativeness',
-    'world',
-    'depth_prompt',
-];
-
 const MAX_LIST_RESULTS = 200;
 const DEFAULT_READ_MAX_CHARS = 200_000;
 
@@ -120,21 +101,6 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         return script.characters[chid].avatar;
     }
 
-    function normalizeFieldsParam(fields) {
-        if (fields === undefined || fields === null) {
-            return DEFAULT_READ_FIELDS;
-        }
-        if (!Array.isArray(fields)) {
-            throw designerError('designer.invalid_fields', 'fields must be an array of character field names.');
-        }
-        const normalized = [...new Set(fields.map((field) => String(field).trim()).filter(Boolean))]
-            .filter((field) => CHARACTER_FIELD_LIST.includes(field));
-        if (normalized.length === 0) {
-            throw designerError('designer.invalid_fields', `fields must be a subset of: ${CHARACTER_FIELD_LIST.join(', ')}.`);
-        }
-        return normalized;
-    }
-
     async function read(params = {}) {
         const avatar = optionalString(params.avatar);
 
@@ -147,12 +113,11 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         }
 
         const character = await resolveCharacter(avatar);
-        const fields = normalizeFieldsParam(params.fields);
         const maxChars = normalizeMaxChars(params.maxChars, DEFAULT_READ_MAX_CHARS);
         const data = character.data ?? {};
         const canonicalAvatar = character.avatar;
         const view = characterView(data);
-        const selected = pickFields(view, fields);
+        const selected = pickFields(view, CHARACTER_FIELD_LIST);
         const limited = limitObjectStrings(selected, maxChars);
         const truncated = JSON.stringify(selected) !== JSON.stringify(limited);
         const rev = await revLock.issue(key(canonicalAvatar), fingerprintTarget(canonicalAvatar, data), { truncated });
@@ -259,23 +224,16 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         verbs: {
             read: {
                 action: read,
-                description: 'List all characters, or read one character card. Use this when the user asks you to design or modify characters. Omit avatar to list characters (avatar and name only). Pass avatar plus optional fields[] and maxChars to read a card; the result includes a rev that update_character/delete_character require. Use this before modifying a character.',
                 parameters: {
                     type: 'object',
                     properties: {
                         avatar: { type: 'string', description: 'Character avatar id (e.g. "Seraphina.png"). Omit to list characters.' },
-                        fields: {
-                            type: 'array',
-                            items: { type: 'string' },
-                            description: `Character fields to return. Default: ${DEFAULT_READ_FIELDS.join(', ')}.`,
-                        },
                         maxChars: { type: 'integer', description: 'Per-field character limit for long text fields (default 200000).' },
                     },
                 },
             },
             create: {
                 action: create,
-                description: 'Create a new character card. card.name is required; other card fields (description, personality, scenario, first_mes, mes_example, system_prompt, post_history_instructions, creator_notes, creator, character_version, tags, talkativeness, world, depth_prompt) are optional. The change applies immediately and is shown in the chat.',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -291,12 +249,11 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
             },
             update: {
                 action: update,
-                description: 'Replace the editable fields of an existing character card with the COMPLETE card object: copy every field from read_character (name, description, personality, scenario, first_mes, mes_example, system_prompt, post_history_instructions, creator_notes, creator, character_version, tags, talkativeness, world, depth_prompt) and change only what you need; partial cards are rejected with designer.incomplete_update. Requires a rev from read_character so the change is based on the latest state. The avatar file itself is never modified.',
                 parameters: {
                     type: 'object',
                     properties: {
                         avatar: { type: 'string', description: 'Character avatar id. Omit to use the character of the current chat.' },
-                        rev: { type: 'string', description: 'Revision obtained from read_character.' },
+                        rev: { type: 'string', description: 'Revision obtained from read.' },
                         card: {
                             type: 'object',
                             description: 'Complete character card data. All fields are required; copy unchanged values from the read result.',
@@ -309,12 +266,11 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
             },
             delete: {
                 action: remove,
-                description: 'Delete an existing character card. Requires a rev from read_character. deleteChats defaults to false (chat files are kept); set it to true only when the user explicitly asks to delete the chats too. This is destructive and irreversible.',
                 parameters: {
                     type: 'object',
                     properties: {
                         avatar: { type: 'string', description: 'Character avatar id. Omit to use the character of the current chat.' },
-                        rev: { type: 'string', description: 'Revision obtained from read_character.' },
+                        rev: { type: 'string', description: 'Revision obtained from read.' },
                         deleteChats: { type: 'boolean', description: 'Also delete the character chat files. Default false.' },
                     },
                     required: ['rev'],

@@ -39,7 +39,7 @@ const WORLD_ENTRY_SCHEMA = {
 /**
  * World info (lorebook) resource adapter. Entry-level operations are the
  * primary surface; book-level create/delete are supported with an explicit rev.
- * @param {{st: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>}} deps
+ * @param {{worldInfo: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>}} deps
  */
 export function createWorldInfoResource({ worldInfo, revLock }) {
     const bookKey = (book) => `world:${book}`;
@@ -83,7 +83,7 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
     }
 
     async function read(params = {}) {
-                const book = optionalString(params.book);
+        const book = optionalString(params.book);
 
         if (!book) {
             const books = [...worldInfo.worldInfoCache.keys()]
@@ -130,7 +130,7 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
     }
 
     async function create(params = {}) {
-                const book = requireString(params.book, 'book');
+        const book = requireString(params.book, 'book');
         const existing = worldInfo.worldInfoCache.get(book);
 
         if (params.entry === undefined || params.entry === null) {
@@ -157,7 +157,7 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
     }
 
     async function update(params = {}) {
-                const book = requireString(params.book, 'book');
+        const book = requireString(params.book, 'book');
         const uid = requireString(params.uid, 'uid');
         const data = getBook(book);
         const entry = getEntry(data, book, uid);
@@ -178,7 +178,7 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
     }
 
     async function remove(params = {}) {
-                const book = requireString(params.book, 'book');
+        const book = requireString(params.book, 'book');
         const data = getBook(book);
 
         if (params.uid === undefined || params.uid === null) {
@@ -208,7 +208,6 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
         verbs: {
             read: {
                 action: read,
-                description: 'List world info (lorebooks), read a book entry index, or read a single entry. Use this when the user asks you to design or modify world/lore content. Omit book to list books. Pass book without uid to list entries (returns a book rev). Pass book and uid to read one entry (returns an entry rev). Use before modifying anything.',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -220,7 +219,6 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
             },
             create: {
                 action: create,
-                description: 'Create a new world info (lorebook) or a new entry inside one. Pass only book to create an empty book. Pass book plus an entry object (key is required, at least one keyword) to create an entry; the book may already exist. The change applies immediately.',
                 parameters: {
                     type: 'object',
                     properties: {
@@ -236,13 +234,12 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
             },
             update: {
                 action: update,
-                description: 'Replace the editable fields of a world info entry with the COMPLETE entry object: copy every field from read_world_info (key, keysecondary, comment, content, constant, selective, disable, excludeRecursion, preventRecursion, order, position, delayUntilRecursion, depth, group) and change only what you need; partial entries are rejected with designer.incomplete_update. Requires a rev from read_world_info so the change is based on the latest state.',
                 parameters: {
                     type: 'object',
                     properties: {
                         book: { type: 'string', description: 'World info (lorebook) name.' },
                         uid: { type: 'string', description: 'Entry uid.' },
-                        rev: { type: 'string', description: 'Revision obtained from read_world_info.' },
+                        rev: { type: 'string', description: 'Revision obtained from read.' },
                         entry: {
                             type: 'object',
                             description: 'Complete entry data. All fields are required; copy unchanged values from the read result.',
@@ -255,13 +252,12 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
             },
             delete: {
                 action: remove,
-                description: 'Delete a world info entry, or the whole world info (lorebook) when uid is omitted. Requires a rev from read_world_info. Deleting a book does not update character links. This is destructive and irreversible.',
                 parameters: {
                     type: 'object',
                     properties: {
                         book: { type: 'string', description: 'World info (lorebook) name.' },
                         uid: { type: 'string', description: 'Entry uid. Omit to delete the whole book.' },
-                        rev: { type: 'string', description: 'Revision obtained from read_world_info (entry rev for entries, book rev for the book).' },
+                        rev: { type: 'string', description: 'Revision obtained from read (entry rev for entries, book rev for the book).' },
                     },
                     required: ['book', 'rev'],
                 },
