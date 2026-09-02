@@ -18,6 +18,8 @@ import {
     deleteWorldInfo,
     getFreeWorldEntryUid,
     newWorldInfoEntryTemplate,
+    showWorldEditor,
+    updateWorldInfoList,
 } from '../../world-info.js';
 import { getPresetManager } from '../../preset-manager.js';
 import { system_prompts } from '../../sysprompt.js';
@@ -53,6 +55,52 @@ const sysprompt = { system_prompts };
 const powerUser = { power_user };
 const personas = { user_avatar };
 
+/**
+ * Frontend sync after tool writes: the data layer updates the live in-memory
+ * objects (readable by the LLM immediately), but open UI panels need an
+ * explicit re-render. These hooks stay DOM-side (index.js only) so resource
+ * adapters remain pure and testable. Errors are swallowed — UI refresh is
+ * best-effort and must never fail a tool call.
+ */
+const syncUi = {
+    /** Re-render the world info editor when it currently shows the touched book. */
+    async entryChanged(book) {
+        try {
+            const select = document.querySelector('#world_editor_select');
+            if (!select || select.selectedIndex < 0) {
+                return;
+            }
+            const openName = select.options[select.selectedIndex]?.text;
+            if (openName && String(openName).toLowerCase() === String(book).toLowerCase()) {
+                await showWorldEditor(openName);
+            }
+        } catch (error) {
+            console.warn('[Designer] World info editor sync failed:', error);
+        }
+    },
+    /** Rebuild the world info book dropdowns (create/delete book). */
+    async bookListChanged() {
+        try {
+            await updateWorldInfoList();
+        } catch (error) {
+            console.warn('[Designer] World info list sync failed:', error);
+        }
+    },
+};
+
+/** Notify listeners (prompt overrides, agent system) that a card changed. */
+async function emitCharacterEdited(avatar) {
+    try {
+        const index = characters.findIndex((c) => c.avatar === avatar);
+        if (index === -1) {
+            return;
+        }
+        await eventSource.emit(event_types.CHARACTER_EDITED, { detail: { id: index, character: characters[index] } });
+    } catch (error) {
+        console.warn('[Designer] Character edited event failed:', error);
+    }
+}
+
 /** @param {any} context */
 function functionCallingEnabled(context) {
     return Boolean(context?.chatCompletionSettings?.function_calling);
@@ -62,8 +110,8 @@ function functionCallingEnabled(context) {
 function registerTools(context) {
     const revLock = createRevLock();
     const resources = [
-        createCharacterResource({ script, revLock }),
-        createWorldInfoResource({ worldInfo, revLock }),
+        createCharacterResource({ script, revLock, onChanged: emitCharacterEdited }),
+        createWorldInfoResource({ worldInfo, revLock, syncUi }),
         createPromptResource({ presetManager, sysprompt, powerUser, revLock }),
         createPersonaResource({
             personas,

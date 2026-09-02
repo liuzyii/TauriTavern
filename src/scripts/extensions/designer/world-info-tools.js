@@ -39,9 +39,21 @@ const WORLD_ENTRY_SCHEMA = {
 /**
  * World info (lorebook) resource adapter. Entry-level operations are the
  * primary surface; book-level create/delete are supported with an explicit rev.
- * @param {{worldInfo: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>}} deps
+ *
+ * Writes notify the host through the optional `syncUi` hooks so the frontend
+ * can re-render open panels immediately (the data layer mutates the live cache
+ * object in place, so the LLM sees updates right away; the UI needs an
+ * explicit refresh). The adapter itself stays DOM-free and testable.
+ * @param {{
+ *   worldInfo: any,
+ *   revLock: ReturnType<import('./rev-lock.js').createRevLock>,
+ *   syncUi?: {
+ *     entryChanged?: (book: string) => Promise<void> | void,
+ *     bookListChanged?: () => Promise<void> | void,
+ *   },
+ * }} deps
  */
-export function createWorldInfoResource({ worldInfo, revLock }) {
+export function createWorldInfoResource({ worldInfo, revLock, syncUi = {} }) {
     const bookKey = (book) => `world:${book}`;
     const entryKey = (book, uid) => `world-entry:${book}:${uid}`;
 
@@ -140,9 +152,11 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
             const data = { entries: {} };
             await worldInfo.saveWorldInfo(book, data, true);
             const rev = await revLock.commit(bookKey(book), { book, data });
+            await syncUi.bookListChanged?.();
             return ok({ book, created: 'book', rev });
         }
 
+        const isNewBook = !existing || !existing.entries;
         const normalized = normalizeWorldEntryForCreate(params.entry);
         const data = existing && existing.entries ? existing : { entries: {} };
         const uid = worldInfo.getFreeWorldEntryUid(data);
@@ -153,6 +167,10 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
         await worldInfo.saveWorldInfo(book, data, true);
         const rev = await revLock.commit(entryKey(book, uid), data.entries[uid]);
 
+        if (isNewBook) {
+            await syncUi.bookListChanged?.();
+        }
+        await syncUi.entryChanged?.(book);
         return ok({ book, created: 'entry', uid, rev });
     }
 
@@ -173,6 +191,7 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
         Object.assign(entry, normalized);
         await worldInfo.saveWorldInfo(book, data, true);
         const rev = await revLock.commit(entryKey(book, uid), entry);
+        await syncUi.entryChanged?.(book);
 
         return ok({ book, uid, updated: Object.keys(normalized), rev });
     }
@@ -188,6 +207,7 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
                 throw designerError('designer.book_delete_failed', `World info "${book}" could not be deleted.`);
             }
             revLock.forget(bookKey(book));
+            await syncUi.bookListChanged?.();
             return ok({ book, deleted: 'book' });
         }
 
@@ -200,6 +220,7 @@ export function createWorldInfoResource({ worldInfo, revLock }) {
         }
         await worldInfo.saveWorldInfo(book, data, true);
         revLock.forget(entryKey(book, uid));
+        await syncUi.entryChanged?.(book);
         return ok({ book, deleted: 'entry', uid });
     }
 

@@ -62,9 +62,14 @@ const CHARACTER_CARD_SCHEMA = {
 /**
  * Character card resource adapter. The avatar file itself is never modified;
  * it only serves as the (read-only) addressing id.
- * @param {{script: any, revLock: ReturnType<import('./rev-lock.js').createRevLock>, fetchImpl?: typeof fetch}} deps
+ * @param {{
+ *   script: any,
+ *   revLock: ReturnType<import('./rev-lock.js').createRevLock>,
+ *   fetchImpl?: typeof fetch,
+ *   onChanged?: (avatar: string) => Promise<void> | void,
+ * }} deps
  */
-export function createCharacterResource({ script, revLock, fetchImpl = globalThis.fetch }) {
+export function createCharacterResource({ script, revLock, fetchImpl = globalThis.fetch, onChanged }) {
     const key = (avatar) => `character:${avatar}`;
     const fingerprintTarget = (avatar, data) => ({ avatar, data });
 
@@ -159,6 +164,7 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
             data.extensions = { ...(data.extensions || {}), ...normalized.extensions };
         }
         const rev = await revLock.commit(key(avatar), fingerprintTarget(avatar, data));
+        await onChanged?.(avatar);
 
         return ok({ avatar, name, rev });
     }
@@ -193,6 +199,7 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         const mergedData = refreshed?.data ?? applyMergedUpdates(data, normalized);
         const rev = await revLock.commit(key(canonicalAvatar), fingerprintTarget(canonicalAvatar, mergedData));
         const updated = [...Object.keys(normalized.fields), ...Object.keys(normalized.extensions)];
+        await onChanged?.(canonicalAvatar);
 
         return ok({
             avatar: canonicalAvatar,

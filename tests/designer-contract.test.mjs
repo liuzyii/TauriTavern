@@ -688,6 +688,70 @@ test('character tools: read, update with rev lock, create, delete', async () => 
     await assert.rejects(() => byName.delete({ target: 'character', avatar: created2.avatar }), /designer\.rev_required/);
 });
 
+test('world info tools: writes notify UI sync hooks', async () => {
+    const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
+    const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
+    const { createWorldInfoResource } = await importFresh('src/scripts/extensions/designer/world-info-tools.js');
+
+    const worldInfoModule = createFakeWorldInfoModule();
+    const st = fakeSt({
+        scriptModule: createFakeScriptModule(),
+        worldInfoModule,
+        promptModules: createFakePromptModules(),
+    });
+    const calls = { entryChanged: [], bookListChanged: 0 };
+    const tools = buildUnifiedTools([
+        createWorldInfoResource({
+            worldInfo: st.worldInfo,
+            revLock: createRevLock(),
+            syncUi: {
+                entryChanged: (book) => calls.entryChanged.push(book),
+                bookListChanged: () => calls.bookListChanged += 1,
+            },
+        }),
+    ]);
+    const byName = Object.fromEntries(tools.map((t) => [t.name, t.action]));
+
+    // Book create -> book list refresh only
+    await byName.create({ target: 'world_info', book: 'Lorebook' });
+    assert.equal(calls.bookListChanged, 1);
+    assert.deepEqual(calls.entryChanged, []);
+
+    // Entry create on existing book -> entry refresh only
+    await byName.create({ target: 'world_info', book: 'Lorebook', entry: { key: ['castle'], content: 'On a hill.' } });
+    assert.equal(calls.bookListChanged, 1);
+    assert.deepEqual(calls.entryChanged, ['Lorebook']);
+
+    // Entry create on a NEW book -> both refreshes
+    await byName.create({ target: 'world_info', book: 'NewBook', entry: { key: ['x'], content: 'y' } });
+    assert.equal(calls.bookListChanged, 2);
+    assert.deepEqual(calls.entryChanged, ['Lorebook', 'NewBook']);
+
+    // Entry update -> entry refresh
+    const list = await byName.read({ target: 'world_info', book: 'Lorebook' });
+    const uid = String(list.entries[0].uid);
+    const read = await byName.read({ target: 'world_info', book: 'Lorebook', uid });
+    const before = calls.entryChanged.length;
+    await byName.update({
+        target: 'world_info',
+        book: 'Lorebook',
+        uid,
+        rev: read.rev,
+        entry: { key: ['castle'], keysecondary: [], comment: '', content: 'Updated.', constant: false, selective: false, disable: false, excludeRecursion: false, preventRecursion: false, order: 100, position: 0, delayUntilRecursion: 0, depth: 4, group: '' },
+    });
+    assert.deepEqual(calls.entryChanged.slice(before), ['Lorebook']);
+
+    // Entry delete -> entry refresh; book delete -> list refresh
+    const readAfterUpdate = await byName.read({ target: 'world_info', book: 'Lorebook', uid });
+    await byName.delete({ target: 'world_info', book: 'Lorebook', uid, rev: readAfterUpdate.rev });
+    assert.deepEqual(calls.entryChanged.slice(-1), ['Lorebook']);
+    const bookList = await byName.read({ target: 'world_info', book: 'NewBook' });
+    const bookRev = bookList.rev;
+    const beforeList = calls.bookListChanged;
+    await byName.delete({ target: 'world_info', book: 'NewBook', rev: bookRev });
+    assert.equal(calls.bookListChanged, beforeList + 1);
+});
+
 test('world info tools: book and entry CRUD with rev lock', async () => {
     const { createRevLock } = await importFresh('src/scripts/extensions/designer/rev-lock.js');
     const { buildUnifiedTools } = await importFresh('src/scripts/extensions/designer/build-tools.js');
