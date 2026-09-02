@@ -29,7 +29,12 @@ android {
         // behavior (no env var -> tauri.properties/default).
         versionCode = System.getenv("TAURITAVERN_VERSION_CODE")?.toIntOrNull()
             ?: tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
-        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        // versionName: prefer TAURITAVERN_VERSION_NAME (CI sets it to
+        // 2.2.<run_number> so the visible version tracks every build), then
+        // tauri.properties, then 1.0. Cosmetic only - Android upgrade checks
+        // use versionCode above, not this string.
+        versionName = System.getenv("TAURITAVERN_VERSION_NAME")
+            ?: tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
     signingConfigs {
         create("release") {

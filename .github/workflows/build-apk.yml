@@ -122,6 +122,9 @@ jobs:
           # every build, so each APK installs over the previous one (same
           # signature required; see signing step).
           TAURITAVERN_VERSION_CODE: ${{ github.run_number }}
+          # visible version string: 2.2.<run_number> (e.g. 2.2.11). Cosmetic
+          # only - upgrade checks use TAURITAVERN_VERSION_CODE above.
+          TAURITAVERN_VERSION_NAME: 2.2.${{ github.run_number }}
         with:
           projectPath: src-tauri/crates/tauritavern
           tauriScript: node ../../../scripts/tauri-app.mjs
