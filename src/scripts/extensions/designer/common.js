@@ -25,11 +25,31 @@ export function designerError(code, message) {
 }
 
 /**
- * Successful tool result envelope. ToolManager stringifies non-string results.
- * @param {Record<string, any>} [payload]
+ * Models occasionally double-wrap the editable object (e.g. card nested under
+ * another card or under ST's internal `data` key). Unwrap single-key wrappers
+ * while the outer object holds none of the editable fields, bounded to a few
+ * levels. Unambiguous, so the read surface contract is untouched.
+ * @param {any} value
+ * @param {string[]} fields
+ * @param {string[]} [wrapperKeys]
  */
-export function ok(payload = {}) {
-    return { ok: true, ...payload };
+export function unwrapNestedPayload(value, fields, wrapperKeys = ['card', 'data']) {
+    let current = value;
+    for (let depth = 0; depth < 3 && isPlainObject(current); depth += 1) {
+        const keys = Object.keys(current);
+        if (keys.some((key) => fields.includes(key))) {
+            break; // Already a flat editable object.
+        }
+        if (keys.length !== 1 || !wrapperKeys.includes(keys[0])) {
+            break;
+        }
+        const nested = current[keys[0]];
+        if (!isPlainObject(nested)) {
+            break;
+        }
+        current = nested;
+    }
+    return current;
 }
 
 export function truncateText(text, maxChars) {
@@ -51,10 +71,39 @@ export function pickFields(object, fields) {
 }
 
 /**
+ * Resolves the `fields` parameter of a read tool. Omitted means "all
+ * readable fields"; a provided list must be a non-empty subset of the
+ * readable (and writable) surface for the target.
+ * @param {unknown} fields
+ * @param {string[]} available
+ * @param {string} label
+ * @returns {string[]}
+ */
+export function normalizeFieldSelection(fields, available, label) {
+    if (fields === undefined || fields === null) {
+        return available;
+    }
+    if (!Array.isArray(fields) || fields.length === 0) {
+        throw designerError('designer.invalid_fields', `${label} fields must be a non-empty array of field names.`);
+    }
+    const list = [...new Set(fields.map((field) => String(field).trim()).filter(Boolean))];
+    if (list.length === 0) {
+        throw designerError('designer.invalid_fields', `${label} fields must be a non-empty array of field names.`);
+    }
+    const unknown = list.filter((field) => !available.includes(field));
+    if (unknown.length > 0) {
+        throw designerError(
+            'designer.invalid_fields',
+            `Unknown ${label} field(s): ${unknown.join(', ')}. Available fields: ${available.join(', ')}.`,
+        );
+    }
+    return list;
+}
+
+/**
  * Truncates long string fields of a read result. Arrays and nested objects
- * stay verbatim: under the complete-object update contract the model must be
- * able to copy every editable value back unchanged, so values must never be
- * summarized into counts.
+ * stay verbatim so read values are never summarized into counts or shapes —
+ * the model needs exact values to display or patch them.
  * @param {Record<string, any>} object
  * @param {number} maxChars
  */
@@ -119,27 +168,6 @@ export async function verifyRevOrThrow(revLock, key, suppliedRev, currentValue) 
     return verified.rev;
 }
 
-/**
- * Rev gate for update tools: verify the rev, then refuse updates based on a
- * truncated read (writing a truncated echo back would silently overwrite
- * content). Delete tools use verifyRevOrThrow only — deletion is identity
- * based and cannot lose content.
- * @param {ReturnType<import('./rev-lock.js').createRevLock>} revLock
- * @param {string} key
- * @param {unknown} suppliedRev
- * @param {any} currentValue
- * @returns {Promise<string>}
- */
-export async function verifyUpdateOrThrow(revLock, key, suppliedRev, currentValue) {
-    await verifyRevOrThrow(revLock, key, suppliedRev, currentValue);
-    if (revLock.isTruncated(key)) {
-        throw designerError(
-            'designer.truncated_read',
-            'The last read of this object was truncated. Re-read with a larger maxChars and retry with the complete values.',
-        );
-    }
-}
-
 export function normalizeBoolean(value, label) {
     if (typeof value !== 'boolean') {
         throw designerError('designer.invalid_boolean', `${label} must be a boolean.`);
@@ -199,6 +227,28 @@ export const CHARACTER_FIELD_LIST = [
     'depth_prompt',
 ];
 
+/**
+ * Single source of field semantics: `role` is emitted as the JSON-schema
+ * property description on create/update — the complete per-field spec.
+ */
+export const CHARACTER_FIELD_META = {
+    name: { role: 'Display name.' },
+    description: { role: 'Persona, voice and style.' },
+    personality: { role: 'Traits.' },
+    scenario: { role: 'Current scene setup.' },
+    first_mes: { role: 'Opening greeting.' },
+    mes_example: { role: 'Example dialogue that anchors the writing style (few-shot).' },
+    system_prompt: { role: 'Extra instructions injected with the card.' },
+    post_history_instructions: { role: 'Instructions injected after the chat history.' },
+    creator_notes: { role: 'Author notes (metadata, not injected).' },
+    creator: { role: 'Author name (metadata).' },
+    character_version: { role: 'Card version (metadata).' },
+    tags: { role: 'Freeform labels (not injected).' },
+    talkativeness: { role: 'Verbosity: 0 = terse, 1 = verbose.' },
+    world: { role: 'Name of the primary lorebook attached to this character.' },
+    depth_prompt: { role: 'Recurring instruction injected at a chosen depth.' },
+};
+
 export const CHARACTER_MAX_STRING_LENGTH = 200_000;
 export const CHARACTER_MAX_TAGS = 100;
 export const CHARACTER_MAX_TAG_LENGTH = 200;
@@ -213,7 +263,7 @@ function normalizeTags(value) {
     return value.map((item) => {
         const tag = String(item).trim();
         if (!tag || tag.length > CHARACTER_MAX_TAG_LENGTH) {
-            throw designerError('designer.invalid_tags', 'Each tag must be a non-empty string of at most 200 characters.');
+            throw designerError('designer.invalid_tags', `Each tag must be a non-empty string of at most ${CHARACTER_MAX_TAG_LENGTH} characters.`);
         }
         return tag;
     });
@@ -336,6 +386,23 @@ export const WORLD_ENTRY_FIELD_LIST = [
     ...WORLD_ENTRY_LIST_FIELDS,
 ];
 
+export const WORLD_ENTRY_FIELD_META = {
+    key: { role: 'Trigger keywords. The entry activates when the chat matches any of them. There is no title field — the display name belongs in comment.' },
+    keysecondary: { role: 'Secondary keywords. Selective entries also need one of these to match.' },
+    comment: { role: 'Short label shown in the editor as the entry title (Title/Memo column). Not injected into the prompt.' },
+    content: { role: 'Lore text injected when the entry activates. Macros like {{...}} are supported.' },
+    constant: { role: 'Always injected; no keyword match needed.' },
+    selective: { role: 'Requires a keysecondary match in addition to a key match. Default true.' },
+    disable: { role: 'true = entry is off; the UI shows enabled = !disable.' },
+    excludeRecursion: { role: 'Recursion guard: controls whether this entry participates in chained activations from other entries.' },
+    preventRecursion: { role: 'Recursion guard: controls whether this entry can chain-activate other entries.' },
+    order: { role: 'Injection priority at equal depth: higher = earlier. Default 100.' },
+    position: { role: 'Placement slot within the depth band. Default 0.' },
+    delayUntilRecursion: { role: 'Recursion-delay counter. Default 0.' },
+    depth: { role: 'Chat-depth tier: 0 = character definition, 4 = near the newest messages. Default 4.' },
+    group: { role: 'Shared group: only one matching member of the group injects.' },
+};
+
 export const WORLD_ENTRY_MAX_CONTENT_LENGTH = 500_000;
 export const WORLD_ENTRY_MAX_COMMENT_LENGTH = 10_000;
 export const WORLD_ENTRY_MAX_KEYWORD_LENGTH = 500;
@@ -419,66 +486,6 @@ export function normalizeWorldEntryForCreate(entry) {
         throw designerError('designer.entry_key_required', 'A world info entry requires at least one key.');
     }
     return normalized;
-}
-
-/** Fields a complete prompt update must carry. */
-export const PROMPT_COMPLETE_FIELDS = ['content', 'post_history'];
-
-/**
- * True when a value is empty/default-ish, i.e. omitting it in an update loses
- * no information. Real models routinely drop empty string fields from echoed
- * objects; rejecting those would burn tool-loop rounds for nothing.
- * @param {any} value
- */
-function isDefaultish(value) {
-    if (value === null || value === undefined) {
-        return true;
-    }
-    if (typeof value === 'string') {
-        return value === '';
-    }
-    if (typeof value === 'boolean') {
-        return value === false;
-    }
-    if (typeof value === 'number') {
-        return value === 0;
-    }
-    if (Array.isArray(value)) {
-        return value.length === 0;
-    }
-    return false;
-}
-
-/**
- * Enforces the complete-object update contract: updates must carry every
- * editable field that currently holds content. Missing fields whose current
- * value is empty/default are auto-filled from the current object (no data can
- * be lost), while missing non-empty fields are rejected so a modification can
- * never silently drop object properties. The model is expected to copy
- * non-empty values from the read result.
- * @param {any} provided
- * @param {string[]} requiredFields
- * @param {string} label
- * @param {{current?: Record<string, any>}} [options]
- * @returns {Record<string, any>}
- */
-export function requireCompleteFields(provided, requiredFields, label, { current = {} } = {}) {
-    if (!isPlainObject(provided)) {
-        throw designerError('designer.invalid_object', `${label} must be an object.`);
-    }
-    const missing = requiredFields.filter((field) => !Object.prototype.hasOwnProperty.call(provided, field));
-    const lossy = missing.filter((field) => !isDefaultish(current[field]));
-    if (lossy.length > 0) {
-        throw designerError(
-            'designer.incomplete_update',
-            `${label} must include every field that currently holds content; missing: ${lossy.join(', ')}. Copy the old values from the read result and resend the complete ${label}.`,
-        );
-    }
-    const completed = { ...provided };
-    for (const field of missing) {
-        completed[field] = current[field];
-    }
-    return completed;
 }
 
 /**

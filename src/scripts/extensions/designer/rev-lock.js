@@ -70,23 +70,17 @@ export async function fingerprint(value, hash = sha256Hex) {
 export function createRevLock({ hash = sha256Hex } = {}) {
     /** @type {Map<string, string>} */
     const issued = new Map();
-    /** @type {Map<string, {truncated: boolean}>} */
-    const flags = new Map();
 
     /**
      * Issues (or re-issues) a rev for a target and records it in the session
-     * registry. Read tools use this for the values they return; pass
-     * `truncated: true` when the read result was cut off so updates based on
-     * it can be refused (a truncated echo would silently overwrite data).
+     * registry. Read tools use this for the values they return.
      * @param {string} key
      * @param {any} value
-     * @param {{truncated?: boolean}} [options]
      * @returns {Promise<string>}
      */
-    async function issue(key, value, { truncated = false } = {}) {
+    async function issue(key, value) {
         const rev = await fingerprint(value, hash);
         issued.set(key, rev);
-        flags.set(key, { truncated: !!truncated });
         return rev;
     }
 
@@ -143,9 +137,7 @@ export function createRevLock({ hash = sha256Hex } = {}) {
     }
 
     /**
-     * Records the new fingerprint of a target after a successful write. A
-     * post-write state is by definition complete, so the truncated flag is
-     * cleared.
+     * Records the new fingerprint of a target after a successful write.
      * @param {string} key
      * @param {any} value
      * @returns {Promise<string>}
@@ -153,7 +145,6 @@ export function createRevLock({ hash = sha256Hex } = {}) {
     async function commit(key, value) {
         const rev = await fingerprint(value, hash);
         issued.set(key, rev);
-        flags.set(key, { truncated: false });
         return rev;
     }
 
@@ -163,18 +154,7 @@ export function createRevLock({ hash = sha256Hex } = {}) {
      */
     function forget(key) {
         issued.delete(key);
-        flags.delete(key);
     }
 
-    /**
-     * True when the latest read of the target was truncated. Updates based on
-     * a truncated read are refused to prevent truncated text being written
-     * back over full content.
-     * @param {string} key
-     */
-    function isTruncated(key) {
-        return flags.get(key)?.truncated === true;
-    }
-
-    return { issue, verify, commit, forget, isTruncated };
+    return { issue, verify, commit, forget };
 }

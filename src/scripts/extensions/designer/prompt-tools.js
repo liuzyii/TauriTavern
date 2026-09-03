@@ -1,15 +1,12 @@
 // @ts-check
 
 import {
-    PROMPT_COMPLETE_FIELDS,
     designerError,
     normalizeMaxChars,
-    ok,
     optionalString,
-    requireCompleteFields,
     requireString,
+    truncateText,
     verifyRevOrThrow,
-    verifyUpdateOrThrow,
 } from './common.js';
 
 const DEFAULT_READ_MAX_CHARS = 200_000;
@@ -41,6 +38,11 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
     function findPreset(list, name) {
         const normalized = String(name ?? '').trim().toLowerCase();
         return list.find((preset) => String(preset.name ?? '').trim().toLowerCase() === normalized);
+    }
+
+    function notFoundMessage(name, list) {
+        const available = list.slice(0, 8).map((preset) => preset.name).join(', ');
+        return `System prompt "${name}" was not found. Available presets: ${available || 'none'}.`;
     }
 
     /**
@@ -80,32 +82,34 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
                 name: preset.name,
                 contentChars: String(preset.content ?? '').length,
             }));
-            return ok({
+            return {
                 prompts,
                 count: prompts.length,
                 current: {
                     enabled: powerUser.sysprompt.enabled === true,
                     name: powerUser.sysprompt.name || null,
                 },
-            });
+            };
         }
 
         const preset = findPreset(systemPrompts, requested);
         if (!preset) {
-            throw designerError('designer.prompt_not_found', `System prompt "${requested}" was not found.`);
+            throw designerError('designer.prompt_not_found', notFoundMessage(requested, systemPrompts));
         }
         const maxChars = normalizeMaxChars(params.maxChars, DEFAULT_READ_MAX_CHARS);
-        const content = truncatePromptContent(preset.content, maxChars);
+        const content = truncateText(preset.content, maxChars);
         const truncated = String(preset.content ?? '').length !== content.length;
-        const rev = await revLock.issue(key(preset.name), fingerprintTarget(preset), { truncated });
+        const rev = await revLock.issue(key(preset.name), fingerprintTarget(preset));
 
-        return ok({
+        return {
             name: preset.name,
-            content,
-            post_history: preset.post_history,
+            prompt: {
+                content,
+                post_history: String(preset.post_history ?? ''),
+            },
             rev,
             truncated,
-        });
+        };
     }
 
     async function create(params = {}) {
@@ -119,7 +123,7 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
         const preset = { name, content };
         await manager.savePreset(name, preset);
         const rev = await revLock.commit(key(name), fingerprintTarget(preset));
-        return ok({ name, rev });
+        return { name, rev };
     }
 
     async function update(params = {}) {
@@ -127,22 +131,27 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
         const name = resolveTargetName(optionalString(params.name), powerUser);
         const preset = findPreset(systemPrompts, name);
         if (!preset) {
-            throw designerError('designer.prompt_not_found', `System prompt "${name}" was not found.`);
+            throw designerError('designer.prompt_not_found', notFoundMessage(name, systemPrompts));
         }
-        await verifyUpdateOrThrow(revLock, key(name), params.rev, fingerprintTarget(preset));
+        await verifyRevOrThrow(revLock, key(name), params.rev, fingerprintTarget(preset));
 
-        // Complete-object contract: content and post_history are both required;
-        // a missing empty post_history is auto-filled from the current preset,
-        // and an explicit null means "keep the current value".
-        const completePrompt = requireCompleteFields(params.prompt, PROMPT_COMPLETE_FIELDS, 'prompt', { current: preset });
-        if (completePrompt.content !== null && completePrompt.content !== undefined) {
-            preset.content = normalizeContent(completePrompt.content);
+        // Patch semantics: only the provided fields change; an explicit null
+        // means "keep the current value".
+        const changes = {};
+        if (params.prompt?.content !== undefined && params.prompt?.content !== null) {
+            changes.content = normalizeContent(params.prompt.content);
         }
-        preset.post_history = String(completePrompt.post_history ?? '');
+        if (params.prompt?.post_history !== undefined && params.prompt?.post_history !== null) {
+            changes.post_history = String(params.prompt.post_history);
+        }
+        if (Object.keys(changes).length === 0) {
+            throw designerError('designer.no_fields', 'No updatable prompt fields were provided. Send content and/or post_history.');
+        }
+        Object.assign(preset, changes);
         await manager.savePreset(name, { ...preset });
         const rev = await revLock.commit(key(name), fingerprintTarget(preset));
 
-        return ok({ name, rev });
+        return { updated: Object.keys(changes), rev };
     }
 
     async function remove(params = {}) {
@@ -151,7 +160,7 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
 
         const preset = findPreset(systemPrompts, name);
         if (!preset) {
-            throw designerError('designer.prompt_not_found', `System prompt "${name}" was not found.`);
+            throw designerError('designer.prompt_not_found', notFoundMessage(name, systemPrompts));
         }
         await verifyRevOrThrow(revLock, key(preset.name), params.rev, fingerprintTarget(preset));
 
@@ -161,7 +170,7 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
         }
         revLock.forget(key(preset.name));
 
-        return ok({ deleted: preset.name });
+        return { deleted: preset.name };
     }
 
     return {
@@ -173,7 +182,7 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
                     type: 'object',
                     properties: {
                         name: { type: 'string', description: 'System prompt preset name. Omit to list presets.' },
-                        maxChars: { type: 'integer', description: 'Character limit for content (default 200000).' },
+                        maxChars: { type: 'integer', description: 'Per-field character limit for long text (default 200000).' },
                     },
                 },
             },
@@ -197,12 +206,11 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
                         rev: { type: 'string', description: 'Revision obtained from read.' },
                         prompt: {
                             type: 'object',
-                            description: 'Complete prompt data. Both fields are required; copy unchanged values from the read result.',
+                            description: 'Patch: include ONLY the fields to change (content and/or post_history); omitted fields keep their current values.',
                             properties: {
                                 content: { type: 'string' },
                                 post_history: { type: 'string' },
                             },
-                            required: PROMPT_COMPLETE_FIELDS,
                         },
                     },
                     required: ['rev', 'prompt'],
@@ -221,12 +229,4 @@ export function createPromptResource({ presetManager, sysprompt, powerUser, revL
             },
         },
     };
-}
-
-function truncatePromptContent(content, maxChars) {
-    const text = String(content ?? '');
-    if (!(maxChars > 0) || text.length <= maxChars) {
-        return text;
-    }
-    return `${text.slice(0, maxChars)}…[truncated ${text.length - maxChars} chars]`;
 }

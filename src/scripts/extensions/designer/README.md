@@ -16,14 +16,14 @@ Designer 是随 TauriTavern 打包的系统默认扩展：用户开启 **“启�
 
 | 工具 | target=character | target=persona | target=world_info | target=prompt |
 | --- | --- | --- | --- | --- |
-| `read` | `avatar?`、`maxChars?`（省略 avatar 列角色；读取面 = 更新面，恒返回全部可编辑字段） | `id?`（省略列全部人设 + 当前项） | `book?`、`uid?`、`maxChars?`（省略 book 列书；book 无 uid 列条目） | `name?`、`maxChars?`（省略 name 列预设 + 当前项） |
+| `read` | `avatar?`、`fields[]?`、`maxChars?`（省略 avatar 列角色；fields 限定返回属性） | `id?`（省略列全部人设 + 当前项） | `book?`、`uid?`、`fields[]?`、`maxChars?`（省略 book 列书；book 无 uid 列条目；fields 限定条目返回属性） | `name?`、`maxChars?`（省略 name 列预设 + 当前项） |
 | `create` | `card`（name 必填） | —（v1 不支持，人设由 UI 创建） | `book`、`entry?`（key 至少一个关键字） | `name`、`content` |
-| `update` | `avatar?`、`rev`、`card`（完整对象） | `id?`、`rev`、`persona`（`{name, description}`） | `book`、`uid`、`rev`、`entry`（完整条目） | `name?`、`rev`、`prompt`（`{content, post_history}`） |
+| `update` | `avatar?`、`rev`、`card`（补丁） | `id?`、`rev`、`persona`（补丁） | `book`、`uid`、`rev`、`entry`（补丁） | `name?`、`rev`、`prompt`（补丁） |
 | `delete` | `avatar?`、`rev`、`deleteChats?` | —（v1 不支持） | `book`、`uid?`、`rev`（有 uid 删条目，无 uid 删整书） | `name?`、`rev` |
 
 - 角色卡可编辑字段：`name, description, personality, scenario, first_mes, mes_example, system_prompt, post_history_instructions, creator_notes, creator, character_version, tags, talkativeness, world, depth_prompt`；**avatar（头像文件）不可由工具修改**，由用户自行维护。
 - 人设（User Persona）可编辑字段：`name, description`（描述会注入提示词）；头像与注入位置/深度/角色等配置由 UI 维护；`id` 省略时作用于当前人设。
-- 世界书条目可编辑字段：`key, keysecondary, comment, content, constant, selective, disable, excludeRecursion, preventRecursion, order, position, delayUntilRecursion, depth, group`（读取结果只含这些字段，保证“照抄读取结果”恰好可满足）。
+- 世界书条目可编辑字段：`key, keysecondary, comment, content, constant, selective, disable, excludeRecursion, preventRecursion, order, position, delayUntilRecursion, depth, group`（读取面 == 写入面，逐字段含义见 create/update 的 schema 属性描述）。
 - 读取返回 `rev`；`update` / `delete` 必须携带同一 `rev`。
 - 保存/删除预设遵循 ST UI 行为（保存后该预设成为当前选中的系统提示词；删除当前选中项时自动切换到第一个预设）。
 
@@ -44,15 +44,16 @@ prompts: "RP", "Design Session" (active)
 - id 前置、名称加引号、书带条目数、当前预设标 `(active)`——模型可直接拿 id 调 `read`；
 - 受 `function_calling` 过滤门控（与工具同门控），关闭即不可见；列表按类截断（默认 20 项）控制 token 成本。
 
-## 更新契约：完整对象替换
+## 更新契约：补丁式修改（Patch）
 
-`update` 工具以**完整对象替换**为契约，且不允许任何字段丢失：
+`update` 工具为**补丁语义**：只发送要修改的属性（一个或多个），负载与改动量成正比，不要求回显整个对象：
 
-- **非空字段缺失** → 可恢复错误 `designer.incomplete_update`（列出缺失字段，提示从 read 结果照抄）——防止模型"只改一半"悄悄丢内容；
-- **空/默认字段缺失** → 自动沿用当前值（真实模型会习惯性省略空字符串字段，实测严格拒绝会白白烧掉工具轮次）；
-- **显式 `null`** → 语义为"保持当前值/不设置"（模型 JSON 习惯），create 时等价于缺省；
-- 因此 `read` 默认返回完整可编辑值：字符串数组（tags/key 等）**原样返回**（不压缩成计数），长文本按 `maxChars` 截断（默认 200000）；**若读取被截断，基于它的更新会被 `designer.truncated_read` 拒绝**，必须用更大 `maxChars` 重读——防止截断文本写回覆盖完整内容；读取面与更新面严格一致（只含可编辑字段），保证"照抄读取结果"恰好可满足；
-- 该契约与 `rev` 锁配合：读 → 拿 `rev` 与全量字段 → 改 → 完整提交，从机制上杜绝"改一半丢字段"。
+- **只改所给字段**：`card` / `entry` / `persona` / `prompt` 内出现哪些键就只写哪些键；键缺失 = 不动；仅含 `null` 的空补丁被拒绝（`designer.no_fields`）；
+- **显式 `null`** → 语义为"保持当前值/不设置"；清空字段请发送 `""` 或 `[]`；
+- **容器键一致**：read 详情返回的容器键与 update 消费键完全相同（character → `card`、world_info → `entry`、prompt → `prompt`、persona → `persona`），杜绝"改名嵌套"类错误；对 `card` 的意外双层嵌套（`card.card` / `card.data`）做无歧义解包容错；
+- `read` 默认返回完整可编辑值：字符串数组（tags/key 等）**原样返回**，长文本按 `maxChars` 截断（默认 200000）；截断标记（`truncated: true`）仅为信息提示，补丁只写所见字段，不再阻断 update；
+- 全量提交仍是合法超集（一次提交所有键 = 一次改完全部字段）；
+- **读取面 == 写入面**：`read` 支持 `fields[]` 只取所需属性（不传 = 全部）；字段含义以 create/update schema 的**逐属性描述**为唯一事实源（角色卡 15 项 / 世界书条目 14 项 / 预设 2 项 / 人设 2 项）；`avatar` / `book` / `uid` / `id` / `name` 仅作寻址参数——**不可读入 fields、不可写**（头像即此类特殊属性，直接排除）。
 
 ## 实现结构：资源适配器 + 统一构建器
 
@@ -70,8 +71,14 @@ prompts: "RP", "Design Session" (active)
 `buildUnifiedTools(resources)` 把各资源的同名动词合并成 4 个统一工具，`target`
 参数负责派发（enum 自动来自资源名），每个动词的描述自动拼接各目标的用法。
 新增一种可编辑对象只需新增一个适配器模块并在 `index.js` 注册一行
-（`persona` 即按此路径加入），`target` enum 自动扩展，`tests` 中有可扩展性用例守护。共享的校验/rev/完整对象
+（`persona` 即按此路径加入），`target` enum 自动扩展，`tests` 中有可扩展性用例守护。共享的校验/rev/补丁规范化
 助手集中在 `common.js`。
+
+## 结果体约定（对齐宿主 ToolManager 通道）
+
+- **成功 = 数据本身**：`action` 返回领域对象，ST 自动 JSON 序列化为 tool content——不包信封、无 `ok` 字段。read 详情返回对象本体（含 `card`/`entry`/`prompt`/`persona` 容器与 `rev`），列表返回 `{目标键: [...], count, current?}`，create 返回定位符（`avatar`/`{book, uid}`/`name`）+ `rev`，update 返回 `{updated: [...], rev}`，delete 返回 `{deleted: 标识}`；
+- **失败 = ST 异常通道**：`throw` 携带 `designer.<code>: <可行动消息>`，模型在 tool content 看到 `Error: designer.xxx: …`（消息含当前 rev 或可用清单，可直接重试）；
+- 模型解析规则：**以 `Error:` 开头即失败，否则整个 JSON 即为结果**。
 
 ## rev 状态锁契约
 
@@ -91,8 +98,7 @@ prompts: "RP", "Design Session" (active)
 | `designer.character_not_found` / `designer.book_not_found` / `designer.entry_not_found` / `designer.prompt_not_found` | 目标不存在 |
 | `designer.character_target_required` | 非角色聊天且未传 avatar |
 | `designer.unknown_field` / `designer.invalid_*` | 字段白名单或类型校验失败 |
-| `designer.incomplete_update` | 更新时非空字段缺失（完整对象契约） |
-| `designer.truncated_read` | 基于截断读取的更新被拒绝，需重读 |
+| `designer.no_fields` | 更新补丁不含任何可写字段（空补丁） |
 | `designer.prompt_exists` / `designer.book_exists` | 重名冲突 |
 | `designer.entry_key_required` | 世界书条目缺少关键字 |
 | `designer.field_too_long` | 字段超长 |
@@ -108,7 +114,7 @@ src/scripts/extensions/designer/
 ├── guidance.js        # 注入的系统提示文案（单一事实源，e2e 测试同源使用）
 ├── build-tools.js     # 统一 CRUD 构建器（资源适配器 -> 4 个 target 派发工具）
 ├── rev-lock.js        # canonicalJson / sha256 截断 / rev 登记与校验
-├── common.js          # 白名单、校验、错误码、完整对象契约、ToolManager 定义组装
+├── common.js          # 白名单、校验、错误码、补丁规范化、ToolManager 定义组装
 ├── character-tools.js # 资源适配器：角色卡
 ├── persona-tools.js   # 资源适配器：用户人设
 ├── world-info-tools.js# 资源适配器：世界书
@@ -138,7 +144,7 @@ src/scripts/extensions/designer/
   之后请求不再携带 tools，模型必须以文本收尾；e2e 用 `DESIGNER_E2E_RECURSE_LIMIT`
   环境变量对齐当前用户设置；
 - 角色卡内容已放入系统上下文（同真实 Prompt 组装），工具调用是模型的选择而非必需；
-- 循环内执行的是扩展的真实 action（rev 锁、完整对象契约、容错解析全部生效）。
+- 循环内执行的是扩展的真实 action（rev 锁、字段校验、容错解析全部生效）。
 
 覆盖机制场景（角色卡/世界书/系统提示词 CRUD）与感知场景：
 
@@ -156,8 +162,8 @@ DEEPSEEK_API_KEY=sk-xxx DESIGNER_E2E_RECURSE_LIMIT=8 node scripts/designer-deeps
 ```
 
 **失败口径**：只有「宿主级失败」（未知工具、保存/删除失败等）与场景状态断言失败才判
-FAIL；模型可恢复的错误（rev 锁拒绝、完整对象契约拒绝、参数校验拒绝等）是锁与校验
-在正常工作，只作为指标报告——否则测试测的是模型完美度而非工具正确性。感知场景 P4
+FAIL；模型可恢复的错误（rev 锁拒绝、字段校验拒绝等）是锁与校验在正常工作，只作
+为指标报告——否则测试测的是模型完美度而非工具正确性。感知场景 P4
 自包含（缺少目标世界书时自动播种），可独立运行。
 
 真实测试中发现并修复的问题：
@@ -168,8 +174,8 @@ FAIL；模型可恢复的错误（rev 锁拒绝、完整对象契约拒绝、参
    中以真实人设复测（P3 零工具调用）。
 3. **模型会猜错目标 ID（大小写/名称）**：角色按 avatar 大小写不敏感 + 角色名兜底解析，
    世界书按名称大小写不敏感解析，未找到时错误消息列出可用目标；工具返回规范 avatar。
-4. **读取结果把字符串数组压成计数导致更新丢字段**：`tags:1` 被模型照抄后标签被清空；
-   已改为数组原样返回，并提高默认 `maxChars` 至 200000，配合完整对象契约保证无字段丢失。
+4. **读取结果把字符串数组压成计数导致回显丢字段**：`tags:1` 被模型照抄后标签被清空；
+   已改为数组原样返回（读取面==写入面，值恒为精确原值）。
 
 ## 已知边界（v1）
 

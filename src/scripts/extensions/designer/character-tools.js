@@ -2,20 +2,20 @@
 
 import {
     CHARACTER_FIELD_LIST,
+    CHARACTER_FIELD_META,
     buildCharacterCreatePayload,
     buildCharacterMergePayload,
     designerError,
     isPlainObject,
     limitObjectStrings,
     normalizeCharacterUpdates,
+    normalizeFieldSelection,
     normalizeMaxChars,
-    ok,
     optionalString,
     pickFields,
-    requireCompleteFields,
     requireString,
+    unwrapNestedPayload,
     verifyRevOrThrow,
-    verifyUpdateOrThrow,
 } from './common.js';
 
 const MAX_LIST_RESULTS = 200;
@@ -24,8 +24,7 @@ const DEFAULT_READ_MAX_CHARS = 200_000;
 /**
  * First-class editable view of a character card: world / talkativeness /
  * depth_prompt live under data.extensions in real cards and are surfaced as
- * top-level editable fields here. Both read and update use the same view so
- * defaults and completeness checks stay aligned.
+ * top-level editable fields here, so read and update share one field surface.
  * @param {Record<string, any>} data
  */
 function characterView(data) {
@@ -40,8 +39,9 @@ function characterView(data) {
     };
 }
 
-/** Shared JSON schema properties for the character card (create + update). */
-const CHARACTER_CARD_SCHEMA = {
+/** Shared JSON schema properties for the character card (create + update).
+ *  Descriptions come from CHARACTER_FIELD_META — the single field-spec source. */
+const CHARACTER_CARD_TYPES = {
     name: { type: 'string' },
     description: { type: 'string' },
     personality: { type: 'string' },
@@ -54,9 +54,23 @@ const CHARACTER_CARD_SCHEMA = {
     creator: { type: 'string' },
     character_version: { type: 'string' },
     tags: { type: 'array', items: { type: 'string' } },
-    talkativeness: { type: 'number', description: '0..1' },
-    world: { type: 'string', description: 'Primary world info (lorebook) name.' },
-    depth_prompt: { type: 'object', description: '{ prompt, depth, role }' },
+    talkativeness: { type: 'number' },
+    world: { type: 'string' },
+};
+
+const CHARACTER_CARD_SCHEMA = {
+    ...Object.fromEntries(Object.entries(CHARACTER_CARD_TYPES).map(([field, def]) => [
+        field, { ...def, description: CHARACTER_FIELD_META[field]?.role },
+    ])),
+    depth_prompt: {
+        type: 'object',
+        description: CHARACTER_FIELD_META.depth_prompt.role,
+        properties: {
+            prompt: { type: 'string', description: 'Instruction text injected at the chosen depth.' },
+            depth: { type: 'integer', description: '0 = with the character definition; higher = nearer the newest messages.' },
+            role: { type: 'string', enum: ['system', 'user'], description: 'Injection role.' },
+        },
+    },
 };
 
 /**
@@ -114,7 +128,7 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
                 .slice(0, MAX_LIST_RESULTS)
                 .map((c) => ({ avatar: c.avatar, name: c.name || c.data?.name || '' }))
                 .sort((a, b) => a.name.localeCompare(b.name));
-            return ok({ characters, count: characters.length });
+            return { characters, count: characters.length };
         }
 
         const character = await resolveCharacter(avatar);
@@ -122,26 +136,28 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         const data = character.data ?? {};
         const canonicalAvatar = character.avatar;
         const view = characterView(data);
-        const selected = pickFields(view, CHARACTER_FIELD_LIST);
+        const fields = normalizeFieldSelection(params.fields, CHARACTER_FIELD_LIST, 'character card');
+        const selected = pickFields(view, fields);
         const limited = limitObjectStrings(selected, maxChars);
         const truncated = JSON.stringify(selected) !== JSON.stringify(limited);
-        const rev = await revLock.issue(key(canonicalAvatar), fingerprintTarget(canonicalAvatar, data), { truncated });
+        const rev = await revLock.issue(key(canonicalAvatar), fingerprintTarget(canonicalAvatar, data));
 
-        return ok({
+        return {
             avatar: canonicalAvatar,
             name: character.name || data.name || '',
-            fields: limited,
+            card: limited,
             rev,
             truncated,
-        });
+        };
     }
 
     async function create(params = {}) {
-        if (!isPlainObject(params.card)) {
+        const card = unwrapNestedPayload(params.card, CHARACTER_FIELD_LIST);
+        if (!isPlainObject(card)) {
             throw designerError('designer.invalid_card', 'card must be an object.');
         }
-        const name = requireString(params.card.name, 'card.name');
-        const normalized = normalizeCharacterUpdates(params.card);
+        requireString(card.name, 'card.name');
+        const normalized = normalizeCharacterUpdates(card);
         const payload = buildCharacterCreatePayload(normalized);
 
         const response = await fetchImpl('/api/characters/create', {
@@ -166,7 +182,7 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         const rev = await revLock.commit(key(avatar), fingerprintTarget(avatar, data));
         await onChanged?.(avatar);
 
-        return ok({ avatar, name, rev });
+        return { avatar, rev };
     }
 
     async function update(params = {}) {
@@ -175,14 +191,22 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         const canonicalAvatar = character.avatar;
         const data = character.data ?? {};
 
-        await verifyUpdateOrThrow(revLock, key(canonicalAvatar), params.rev, fingerprintTarget(canonicalAvatar, data));
+        await verifyRevOrThrow(revLock, key(canonicalAvatar), params.rev, fingerprintTarget(canonicalAvatar, data));
 
-        // Complete-object contract: the model must send every editable field
-        // that currently holds content (copying unchanged values from the read
-        // result); missing empty/default fields are auto-filled, missing
-        // non-empty fields are rejected so nothing can be dropped.
-        const card = requireCompleteFields(params.card, CHARACTER_FIELD_LIST, 'card', { current: characterView(data) });
+        // Patch semantics: only the provided fields change; every field that
+        // is omitted keeps its current value. null also means "leave it
+        // unchanged"; send '' / [] / {} to clear a field explicitly.
+        const card = unwrapNestedPayload(params.card, CHARACTER_FIELD_LIST);
+        if (!isPlainObject(card)) {
+            throw designerError('designer.invalid_card', 'card must be an object with at least one editable field.');
+        }
         const normalized = normalizeCharacterUpdates(card);
+        if (Object.keys(normalized.fields).length === 0 && Object.keys(normalized.extensions).length === 0) {
+            throw designerError(
+                'designer.no_fields',
+                `No updatable card fields were provided. Send at least one of: ${CHARACTER_FIELD_LIST.join(', ')}.`,
+            );
+        }
 
         const body = buildCharacterMergePayload(canonicalAvatar, normalized);
         const response = await fetchImpl('/api/characters/merge-attributes', {
@@ -201,12 +225,7 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         const updated = [...Object.keys(normalized.fields), ...Object.keys(normalized.extensions)];
         await onChanged?.(canonicalAvatar);
 
-        return ok({
-            avatar: canonicalAvatar,
-            name: mergedData.name || character.name || '',
-            updated,
-            rev,
-        });
+        return { updated, rev };
     }
 
     async function remove(params = {}) {
@@ -223,7 +242,7 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
         }
         revLock.forget(key(canonicalAvatar));
 
-        return ok({ deleted: canonicalAvatar, deleteChats });
+        return { deleted: canonicalAvatar };
     }
 
     return {
@@ -235,7 +254,8 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
                     type: 'object',
                     properties: {
                         avatar: { type: 'string', description: 'Character avatar id (e.g. "Seraphina.png"). Omit to list characters.' },
-                        maxChars: { type: 'integer', description: 'Per-field character limit for long text fields (default 200000).' },
+                        fields: { type: 'array', items: { type: 'string' }, description: 'Fields to return. Omit for all readable fields; meanings are described in the create/update schema properties.' },
+                        maxChars: { type: 'integer', description: 'Per-field character limit for long text (default 200000).' },
                     },
                 },
             },
@@ -263,9 +283,8 @@ export function createCharacterResource({ script, revLock, fetchImpl = globalThi
                         rev: { type: 'string', description: 'Revision obtained from read.' },
                         card: {
                             type: 'object',
-                            description: 'Complete character card data. All fields are required; copy unchanged values from the read result.',
+                            description: 'Patch: include ONLY the fields to change; omitted fields keep their current values.',
                             properties: CHARACTER_CARD_SCHEMA,
-                            required: CHARACTER_FIELD_LIST,
                         },
                     },
                     required: ['rev', 'card'],

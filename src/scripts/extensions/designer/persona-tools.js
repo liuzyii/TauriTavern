@@ -2,15 +2,11 @@
 
 import {
     designerError,
-    ok,
+    isPlainObject,
     optionalString,
-    requireCompleteFields,
     requireString,
-    verifyUpdateOrThrow,
+    verifyRevOrThrow,
 } from './common.js';
-
-/** Editable surface of a user persona (complete-object contract). */
-const PERSONA_EDITABLE_FIELDS = ['name', 'description'];
 
 /**
  * User persona resource adapter (v1: read + update only).
@@ -74,14 +70,14 @@ export function createPersonaResource({ personas, powerUser, saveSettings, emit,
             const personasList = Object.entries(personasMap())
                 .map(([personaId, name]) => ({ id: personaId, name }))
                 .sort((a, b) => a.name.localeCompare(b.name));
-            return ok({ personas: personasList, count: personasList.length, current: personas.user_avatar || null });
+            return { personas: personasList, count: personasList.length, current: personas.user_avatar || null };
         }
 
         const name = getPersona(id);
         const descriptor = descriptorsMap()[id] ?? {};
         const rev = await revLock.issue(key(id), fingerprintTarget(id, name, descriptor));
 
-        return ok({ id, name, description: descriptor.description ?? '', rev });
+        return { id, persona: { name, description: descriptor.description ?? '' }, rev };
     }
 
     async function update(params = {}) {
@@ -89,19 +85,33 @@ export function createPersonaResource({ personas, powerUser, saveSettings, emit,
         const name = getPersona(id);
         const descriptors = descriptorsMap();
         const descriptor = descriptors[id] ?? (descriptors[id] = {});
-        const current = { name, description: descriptor.description ?? '' };
 
-        await verifyUpdateOrThrow(revLock, key(id), params.rev, fingerprintTarget(id, name, descriptor));
+        await verifyRevOrThrow(revLock, key(id), params.rev, fingerprintTarget(id, name, descriptor));
 
-        const completePersona = requireCompleteFields(params.persona, PERSONA_EDITABLE_FIELDS, 'persona', { current });
-        const nextName = requireString(completePersona.name, 'persona.name');
-        const nextDescription = String(completePersona.description ?? '');
+        // Patch semantics: only the provided fields change. name must be a
+        // non-empty string when provided; description may be any string.
+        const provided = isPlainObject(params.persona) ? params.persona : {};
+        const changes = {};
+        if (provided.name !== undefined && provided.name !== null) {
+            changes.name = requireString(provided.name, 'persona.name');
+        }
+        if (provided.description !== undefined && provided.description !== null) {
+            changes.description = String(provided.description);
+        }
+        if (Object.keys(changes).length === 0) {
+            throw designerError('designer.no_fields', 'No updatable persona fields were provided. Send name and/or description.');
+        }
 
-        personasMap()[id] = nextName;
-        descriptor.description = nextDescription;
-        if (id === personas.user_avatar) {
-            // Legacy sync, mirroring personas.js updatePersonaCallback.
-            powerUser.power_user.persona_description = nextDescription;
+        const nextName = changes.name ?? name;
+        if (changes.name !== undefined) {
+            personasMap()[id] = changes.name;
+        }
+        if (changes.description !== undefined) {
+            descriptor.description = changes.description;
+            if (id === personas.user_avatar) {
+                // Legacy sync, mirroring personas.js updatePersonaCallback.
+                powerUser.power_user.persona_description = changes.description;
+            }
         }
         if (nextName !== name) {
             await emit('PERSONA_RENAMED', { avatarId: id, oldName: name, newName: nextName });
@@ -109,7 +119,7 @@ export function createPersonaResource({ personas, powerUser, saveSettings, emit,
         saveSettings();
         const rev = await revLock.commit(key(id), fingerprintTarget(id, nextName, descriptor));
 
-        return ok({ id, name: nextName, rev });
+        return { updated: Object.keys(changes), rev };
     }
 
     return {
@@ -133,7 +143,7 @@ export function createPersonaResource({ personas, powerUser, saveSettings, emit,
                         rev: { type: 'string', description: 'Revision obtained from read.' },
                         persona: {
                             type: 'object',
-                            description: 'Complete persona data {name, description}; copy unchanged values from the read result.',
+                            description: 'Patch: include ONLY the fields to change (name and/or description); omitted fields keep their current values.',
                             properties: {
                                 name: { type: 'string', description: 'User display name.' },
                                 description: { type: 'string', description: 'User persona description injected into the prompt.' },

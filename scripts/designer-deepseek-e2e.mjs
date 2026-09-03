@@ -18,7 +18,7 @@
 //   3. 循环直到模型输出正文，然后断言沙箱内状态变化是否符合预期。
 //
 // 失败口径：只有「宿主级失败」（未知工具、保存/删除失败等）与场景状态断言失败
-// 才判 FAIL；模型可恢复的错误（rev 锁拒绝、完整对象契约拒绝等）是锁与校验在
+// 才判 FAIL；模型可恢复的错误（rev 锁拒绝、字段校验拒绝等）是锁与校验在
 // 正常工作，只作为指标报告，不判失败——否则测试测的是模型完美度而非工具正确性。
 //
 // 不写入任何真实数据：角色卡/世界书/预设都是内存假后端。
@@ -411,7 +411,7 @@ async function main() {
     await scenario('角色卡：新建 + 读取 + 修改', async () => {
         await runScenario({
             title: '角色卡：新建 + 读取 + 修改',
-            system: 'You are a character design assistant inside a sandbox. Use the provided tools to fulfill the user request. Always read an object before modifying it and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result. Changes apply immediately.',
+            system: 'You are a character design assistant inside a sandbox. Use the provided tools to fulfill the user request. Always read an object before modifying it and pass the returned rev. When updating, send only the fields you want to change; fields you omit stay unchanged. Changes apply immediately.',
             user: '请帮我创建一位叫 Mira 的流浪占卜师角色卡：包含描述（一位流浪的占卜师，用塔罗牌为旅人指引）、性格（神秘、敏锐）、开场白。创建后读取一下确认，然后给她的卡加上深度提示（prompt 聚焦于塔罗占卜场景，depth=2，role=system）。另外把现有角色 Ada 的描述改成 "A quiet librarian who now also catalogs tarot decks."。',
             byName,
             openaiTools,
@@ -429,7 +429,7 @@ async function main() {
     await scenario('世界书：建书 + 建条目 + 改条目', async () => {
         await runScenario({
             title: '世界书：建书 + 建条目 + 改条目',
-            system: 'You are a world-building assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result.',
+            system: 'You are a world-building assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send only the fields you want to change; fields you omit stay unchanged.',
             user: '请为 Mira 创建一本名为 "Mira\'s World" 的世界书，并添加两条条目：一条关键字是 ["tarot_fair"]，内容是 "The Tarot Fair visits every new moon."，comment 写 "占卜集市"；另一条关键字是 ["tower_card"]，内容是塔罗牌"高塔"在故事里的含义。然后读取这本书确认条目，再修改第一条的内容为 "The Tarot Fair visits every new moon, and Mira always has a stall."。',
             byName,
             openaiTools,
@@ -448,7 +448,7 @@ async function main() {
     await scenario('系统提示词：新建 + 读取 + 修改', async () => {
         await runScenario({
             title: '系统提示词：新建 + 读取 + 修改',
-            system: 'You are an assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send the COMPLETE object and copy unchanged fields from the read result.',
+            system: 'You are an assistant inside a sandbox. Use the provided tools to fulfill the user request. Read before modifying and pass the returned rev. When updating, send only the fields you want to change; fields you omit stay unchanged.',
             user: '请创建一个名为 "Design Session" 的系统提示词预设，内容为 "You are helping the user design a story setting."。读取确认后，把它的内容更新为 "You are helping the user design a story setting with consistent world rules."。',
             byName,
             openaiTools,
